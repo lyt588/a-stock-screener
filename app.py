@@ -2779,6 +2779,306 @@ def render_entry_signal(sig: dict, name: str = "", code: str = ""):
     )
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# 规则版 AI 解读
+# ═════════════════════════════════════════════════════════════════════════
+
+def generate_ai_explanation(row: pd.Series) -> dict:
+    """规则版 AI 解读：根据单只股票指标生成自然语言分析（零成本，无需大模型）"""
+    try:
+        def _f(k, d=0.0):
+            try:    return float(row.get(k) or d)
+            except: return d
+        def _b(k):
+            try:    return bool(row.get(k, False))
+            except: return False
+        def _i(k, d=0):
+            try:    return int(row.get(k) or d)
+            except: return d
+
+        name     = str(row.get("name", "该股"))
+        code     = str(row.get("code", ""))
+        pct      = _f("pct_chg")
+        turnover = _f("turnover")
+        vr       = _f("vol_ratio")
+        amount   = _f("amount")
+        consec   = _i("consec_limit")
+        yt_score = _i("yt_score")
+        ret3     = _f("ret3")
+        ma20     = _f("ma20")
+        ma60     = _f("ma60")
+        is_limit = _b("is_limit")
+        is_nh    = _b("is_new_high")
+        is_ma    = _b("is_ma_bull")
+        is_heavy = _b("is_heavy")
+        sector   = str(row.get("sector", ""))
+
+        # ── 入选理由 ────────────────────────────────────────────────
+        reasons = []
+        if is_limit:
+            reasons.append("涨停封板")
+        elif pct >= 9.0:
+            reasons.append(f"涨幅{pct:.1f}%接近涨停")
+        elif pct >= 5.0:
+            reasons.append(f"涨幅{pct:.1f}%强势上涨")
+        elif pct >= 3.0:
+            reasons.append(f"涨幅{pct:.1f}%温和上涨")
+        if consec >= 2:
+            reasons.append(f"{consec}连板")
+        if is_nh:
+            reasons.append("创60日新高")
+        if yt_score >= 150:
+            reasons.append("游资高度关注")
+        elif yt_score >= 80:
+            reasons.append("游资有所关注")
+        if amount >= 1e9:
+            reasons.append(f"成交额{amount/1e8:.1f}亿资金活跃")
+        elif amount >= 5e8:
+            reasons.append(f"成交额{amount/1e8:.1f}亿")
+        entry_str = "、".join(reasons) if reasons else "基础条件达标"
+
+        # ── 趋势判断 ─────────────────────────────────────────────────
+        if is_ma and is_nh:
+            trend_str = (f"均线多头排列（MA20 {ma20:.2f}，MA60 {ma60:.2f}），"
+                         "同时创60日新高，中期趋势强势。")
+        elif is_ma and ma20 > 0 and ma60 > 0:
+            trend_str = (f"均线多头排列（MA20 {ma20:.2f} > MA60 {ma60:.2f}），"
+                         "中期趋势偏强。")
+        elif ma20 > 0 and ma60 > 0 and ma20 < ma60:
+            trend_str = (f"均线空头排列（MA20 {ma20:.2f} < MA60 {ma60:.2f}），"
+                         "趋势偏弱，需谨慎。")
+        else:
+            trend_str = "趋势中性，均线数据待观察（需历史K线）。"
+
+        # ── 量能判断 ─────────────────────────────────────────────────
+        if vr >= 3.0 and is_heavy:
+            vol_str = (f"量比 {vr:.1f}x，明显主力放量，成交量远超均值，"
+                       "资金介入迹象强烈。")
+        elif vr >= 2.0:
+            vol_str = f"量比 {vr:.1f}x，有效放量，资金关注度提升。"
+        elif vr >= 1.0:
+            vol_str = f"量比 {vr:.1f}x，量能温和，未见异常。"
+        elif vr > 0:
+            vol_str = f"量比 {vr:.1f}x，相对缩量，上涨动力需关注。"
+        else:
+            vol_str = "量能数据待获取（需历史K线）。"
+
+        # ── 人气判断（换手率）──────────────────────────────────────
+        if turnover >= 20:
+            sent_str = (f"换手率 {turnover:.1f}%，筹码极度松散，"
+                        "短线博弈激烈，注意派发风险。")
+        elif turnover >= 15:
+            sent_str = (f"换手率 {turnover:.1f}%，换手充分，"
+                        "短线人气旺，筹码较为分散。")
+        elif turnover >= 5:
+            sent_str = (f"换手率 {turnover:.1f}%，换手适中，"
+                        "筹码结构相对健康。")
+        elif turnover > 0:
+            sent_str = f"换手率 {turnover:.1f}%，换手偏低，市场参与度一般。"
+        else:
+            sent_str = "换手率数据暂缺。"
+
+        # ── 板块/龙头判断 ────────────────────────────────────────────
+        sp = []
+        if sector and sector not in ("", "—", "nan"):
+            sp.append(f"所属板块：{sector}")
+        if consec >= 3:
+            sp.append(f"{consec}连板，具备板块龙头潜力")
+        elif consec >= 2:
+            sp.append("2连板，板块联动效应值得关注")
+        if yt_score >= 150:
+            sp.append(f"游资评分 {yt_score}（≥150），活跃度强，短线龙头特征")
+        elif yt_score >= 80:
+            sp.append(f"游资评分 {yt_score}，有资金跟踪迹象")
+        sec_str = "；".join(sp) if sp else "板块/龙头信息待补充（需历史K线）。"
+
+        # ── 风险提示 ─────────────────────────────────────────────────
+        risks = []
+        if consec >= 6:
+            risks.append(f"{consec}连板高位，获利盘沉重，炸板风险大")
+        if ret3 > 20:
+            risks.append(f"近3日涨幅 {ret3:.1f}%，追高风险显著，安全边际不足")
+        elif ret3 > 12:
+            risks.append(f"近3日累计涨 {ret3:.1f}%，注意短线获利回吐压力")
+        if pct >= 7 and not is_limit:
+            risks.append("大幅上涨未封板，尾盘变数较大")
+        if turnover >= 20:
+            risks.append("换手率极高，主力可能借势出货")
+        if vr >= 5 and not is_limit:
+            risks.append(f"量比 {vr:.1f}x 但未封板，注意对倒出货可能")
+        if not risks:
+            risks.append("当前无明显异常风险信号，但投资有风险，请独立判断。")
+        risk_str = " | ".join(risks)
+
+        # ── 综合结论 ─────────────────────────────────────────────────
+        if is_limit and consec >= 3 and yt_score >= 100:
+            conc_str = (f"**{name}** 呈现龙头形态，涨停+{consec}连板+游资高度关注，"
+                        "短线强势特征明显，但高连板阶段仓位管理尤为重要。")
+        elif is_limit and yt_score >= 60:
+            conc_str = (f"**{name}** 涨停封板中，游资评分 {yt_score}，"
+                        "量价配合良好，可关注次日竞价表现。")
+        elif is_ma and vr >= 1.5 and pct >= 3:
+            conc_str = (f"**{name}** 趋势+量能双佳，近期值得持续跟踪，"
+                        "注意做好仓位管理和止损设置。")
+        elif is_nh and is_ma:
+            conc_str = (f"**{name}** 创新高且趋势向好，历史压力位已突破，"
+                        "技术面具备持续性。")
+        else:
+            conc_str = (f"**{name}** 当前信号一般，建议持续观察，"
+                        "等待更明确的量价配合信号再行动。")
+
+        full_text = "\n".join([
+            f"【{name}（{code}）技术观察参考】",
+            f"📌 入选理由：{entry_str}",
+            f"📈 趋势判断：{trend_str}",
+            f"📊 量能判断：{vol_str}",
+            f"🔥 人气判断：{sent_str}",
+            f"🏷️ 板块/龙头：{sec_str}",
+            f"⚠️ 风险提示：{risk_str}",
+            f"💡 综合结论：{conc_str}",
+            "",
+            "以上内容为技术指标观察参考，不构成任何投资建议。"
+            "投资有风险，入市需谨慎。",
+        ])
+
+        return {
+            "name": name, "code": code,
+            "entry_reasons": entry_str, "trend":     trend_str,
+            "volume":        vol_str,   "sentiment": sent_str,
+            "sector":        sec_str,   "risk":      risk_str,
+            "conclusion":    conc_str,  "full_text": full_text,
+        }
+    except Exception:
+        return {
+            "name": str(row.get("name", "未知")), "code": str(row.get("code", "")),
+            "entry_reasons": "数据不足", "trend":     "数据不足",
+            "volume":        "数据不足", "sentiment": "数据不足",
+            "sector":        "数据不足", "risk":      "数据不足",
+            "conclusion":    "数据不足，请先在「实时选股」完成筛选后查看。",
+            "full_text":     "数据不足，请先筛选后再查看解读。",
+        }
+
+
+def generate_daily_review(result_df: pd.DataFrame,
+                          emotion_data: dict | None = None) -> dict:
+    """基于筛选结果生成每日复盘文案（规则版，无需大模型）"""
+    try:
+        if result_df is None or result_df.empty:
+            return {"error": "无筛选结果，请先在「实时选股」执行筛选"}
+
+        today_str = get_beijing_now().strftime("%Y年%m月%d日")
+
+        def _scol(col, d=0):
+            if col not in result_df.columns:
+                return pd.Series([d] * len(result_df))
+            return result_df[col].fillna(d)
+
+        total_cnt  = len(result_df)
+        limit_cnt  = int(_scol("is_limit",    False).sum())
+        consec_max = int(_scol("consec_limit", 0).max())
+        avg_pct    = float(_scol("pct_chg",    0).mean())
+
+        # ── 情绪等级 ──────────────────────────────────────────────────
+        if emotion_data and isinstance(emotion_data, dict) and emotion_data.get("total"):
+            emo_score = int(emotion_data.get("total", 0))
+            emo_phase = emotion_data.get("phase", "—")
+        else:
+            emo_score = min(100, int(limit_cnt * 0.8 + avg_pct * 3 + total_cnt * 0.1))
+            if   emo_score >= 70: emo_phase = "情绪过热"
+            elif emo_score >= 50: emo_phase = "情绪活跃"
+            elif emo_score >= 30: emo_phase = "情绪平稳"
+            else:                 emo_phase = "情绪偏冷"
+
+        # ── 前5名 ─────────────────────────────────────────────────────
+        sort_col = "yt_score" if "yt_score" in result_df.columns else "pct_chg"
+        top5     = result_df.nlargest(5, sort_col) if sort_col in result_df.columns \
+                   else result_df.head(5)
+        top5_lines = []
+        for i, (_, r) in enumerate(top5.iterrows(), 1):
+            _n  = str(r.get("name", ""))
+            _p  = float(r.get("pct_chg", 0) or 0)
+            _c  = int(r.get("consec_limit", 0) or 0)
+            _yt = int(r.get("yt_score", 0) or 0)
+            _brd = f"（{_c}连板）" if _c > 0 else ""
+            top5_lines.append(
+                f"  {i}. {_n}{_brd}  涨{_p:+.1f}%  游资评分{_yt}"
+            )
+
+        # ── 共同特征 ──────────────────────────────────────────────────
+        features = []
+        if "is_limit" in result_df.columns:
+            lim_r = result_df["is_limit"].sum() / total_cnt * 100
+            if lim_r > 40:
+                features.append(f"涨停比例高达 {lim_r:.0f}%，做多热情强烈")
+        if "is_ma_bull" in result_df.columns:
+            ma_r = result_df["is_ma_bull"].sum() / total_cnt * 100
+            if ma_r > 60:
+                features.append(f"{ma_r:.0f}% 个股均线多头，中期趋势偏强")
+        if "is_new_high" in result_df.columns:
+            nh_r = result_df["is_new_high"].sum() / total_cnt * 100
+            if nh_r > 30:
+                features.append(f"{nh_r:.0f}% 个股创60日新高，突破信号密集")
+        if avg_pct >= 5:
+            features.append(f"平均涨幅 {avg_pct:.1f}%，普涨格局")
+        if "vol_ratio" in result_df.columns:
+            avg_vr = float(result_df["vol_ratio"].dropna().mean() or 0)
+            if avg_vr >= 2:
+                features.append(f"平均量比 {avg_vr:.1f}x，整体放量明显")
+        if "sector" in result_df.columns:
+            _s = result_df["sector"].dropna()
+            if not _s.empty:
+                top_sec = _s.value_counts().idxmax()
+                features.append(f"最强板块：{top_sec}")
+        if not features:
+            features = ["个股分化明显，暂无显著共同特征"]
+
+        # ── 风险提示 ──────────────────────────────────────────────────
+        risks = []
+        if consec_max >= 6:
+            risks.append(f"最高连板达 {consec_max} 板，高位品种注意炸板风险")
+        if avg_pct > 7:
+            risks.append("整体涨幅偏高，追高需设好止损")
+        if emo_score >= 75:
+            risks.append("市场情绪偏热，注意高位波动风险")
+        if not risks:
+            risks.append("市场整体风险可控，保持正常仓位管理即可")
+
+        # ── 小红书文案 ────────────────────────────────────────────────
+        xhs = "\n".join([
+            f"📊 {today_str} A股游资行情复盘",
+            "",
+            f"今日情绪：{emo_phase}（参考分 {emo_score}）",
+            f"筛选出强势股 {total_cnt} 只，涨停 {limit_cnt} 只",
+            "",
+            "🔥 今日最强：",
+            *top5_lines,
+            "",
+            "✨ 共同特征：",
+            *[f"  · {f}" for f in features],
+            "",
+            "⚠️ 风险提示：",
+            *[f"  · {r}" for r in risks],
+            "",
+            "📌 以上为技术观察参考，不构成投资建议",
+            "投资有风险，入市需谨慎 #A股 #游资 #选股",
+        ])
+
+        return {
+            "today":      today_str,
+            "emo_phase":  emo_phase,
+            "emo_score":  emo_score,
+            "total_cnt":  total_cnt,
+            "limit_cnt":  limit_cnt,
+            "top5":       top5,
+            "top5_lines": top5_lines,
+            "features":   features,
+            "risks":      risks,
+            "xhs":        xhs,
+        }
+    except Exception as _e:
+        return {"error": f"复盘生成失败：{_e}"}
+
+
 # ── V4 列默认值 & 安全补全 ───────────────────────────────────────────────
 
 # 所有 V4 stocks DataFrame 必须包含的列及其默认值
@@ -3672,18 +3972,20 @@ with st.sidebar:
 
 # ── Session State ─────────────────────────────────────────────────────────
 
-if "result_df"     not in st.session_state: st.session_state.result_df     = pd.DataFrame()
-if "need_hist"     not in st.session_state: st.session_state.need_hist     = False
-if "ai_df"         not in st.session_state: st.session_state.ai_df         = pd.DataFrame()
-if "emotion_data"  not in st.session_state: st.session_state.emotion_data  = {}
-if "emotion_rt"    not in st.session_state: st.session_state.emotion_rt    = pd.DataFrame()
-if "pool_size"     not in st.session_state: st.session_state.pool_size     = 0
-if "rt_count"      not in st.session_state: st.session_state.rt_count      = 0
-if "filter_count"  not in st.session_state: st.session_state.filter_count  = 0
-if "pool_source"   not in st.session_state: st.session_state.pool_source   = "未加载"
-if "pool_log"      not in st.session_state: st.session_state.pool_log      = []
-if "pool_break"    not in st.session_state: st.session_state.pool_break    = {}
-if "v4_result"     not in st.session_state: st.session_state.v4_result     = {}
+if "result_df"      not in st.session_state: st.session_state.result_df      = pd.DataFrame()
+if "need_hist"      not in st.session_state: st.session_state.need_hist      = False
+if "ai_df"          not in st.session_state: st.session_state.ai_df          = pd.DataFrame()
+if "emotion_data"   not in st.session_state: st.session_state.emotion_data   = {}
+if "emotion_rt"     not in st.session_state: st.session_state.emotion_rt     = pd.DataFrame()
+if "pool_size"      not in st.session_state: st.session_state.pool_size      = 0
+if "rt_count"       not in st.session_state: st.session_state.rt_count       = 0
+if "filter_count"   not in st.session_state: st.session_state.filter_count   = 0
+if "pool_source"    not in st.session_state: st.session_state.pool_source    = "未加载"
+if "pool_log"       not in st.session_state: st.session_state.pool_log       = []
+if "pool_break"     not in st.session_state: st.session_state.pool_break     = {}
+if "v4_result"      not in st.session_state: st.session_state.v4_result      = {}
+if "selected_stock" not in st.session_state: st.session_state.selected_stock = ""
+if "daily_review"   not in st.session_state: st.session_state.daily_review   = {}
 
 
 # ── 自动刷新注入 ──────────────────────────────────────────────────────────
@@ -3695,10 +3997,10 @@ if auto_refresh:
 
 # ── Tab 布局 ──────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
     "📊 实时选股", "🏆 龙头榜", "🔥 板块热度", "⭐ 自选股", "📈 个股图表",
     "🤖 AI龙头", "😊 情绪周期", "🔔 竞价监控", "📋 龙虎榜", "🎯 游资行为",
-    "🚀 V4综合分析",
+    "🚀 V4综合分析", "📝 每日复盘",
 ])
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -3774,6 +4076,97 @@ with tab1:
             file_name=f"youzhi_{pd.Timestamp.today().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
         )
+
+        # ── 个股详情区 ────────────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("🔍 个股详情 & AI解读")
+        _det_opts = ["（请选择）"] + [
+            f"{r['name']}（{r['code']}）" for _, r in result_df.iterrows()
+        ]
+        # 尝试恢复上次选中
+        _prev_sel = st.session_state.selected_stock
+        _prev_idx = 0
+        for _ii, _oo in enumerate(_det_opts):
+            if _prev_sel and _prev_sel in _oo:
+                _prev_idx = _ii; break
+        _det_sel = st.selectbox(
+            "选择一只股票查看详情", _det_opts,
+            index=_prev_idx, key="tab1_detail_sel",
+        )
+        if _det_sel and _det_sel != "（请选择）":
+            _dm = re.search(r"（(\d{6})）", _det_sel)
+            if _dm:
+                _dcode = _dm.group(1)
+                st.session_state.selected_stock = _dcode
+                _drows = result_df[result_df["code"].astype(str) == _dcode]
+                if not _drows.empty:
+                    _dr = _drows.iloc[0]
+
+                    def _df(k, d=0.0):
+                        try:    return float(_dr.get(k) or d)
+                        except: return d
+                    def _db(k):
+                        try:    return bool(_dr.get(k, False))
+                        except: return False
+                    def _di(k, d=0):
+                        try:    return int(_dr.get(k) or d)
+                        except: return d
+
+                    _prc   = _df("price")
+                    _pct   = _df("pct_chg")
+                    _amt   = _df("amount")
+                    _turn  = _df("turnover")
+                    _vr    = _df("vol_ratio")
+                    _cons  = _di("consec_limit")
+                    _ma20  = _df("ma20")
+                    _ma60  = _df("ma60")
+                    _nh    = _db("is_new_high")
+                    _lim   = _db("is_limit")
+                    _yts   = _di("yt_score")
+                    _comp  = _df("composite_score")
+
+                    # 8 格指标卡
+                    _dc1, _dc2, _dc3, _dc4 = st.columns(4)
+                    _dc1.metric("最新价",  f"¥{_prc:.2f}")
+                    _dc2.metric("涨跌幅",  f"{_pct:+.2f}%")
+                    _dc3.metric("成交额",  f"{_amt/1e8:.2f} 亿")
+                    _dc4.metric("换手率",  f"{_turn:.1f}%")
+                    _dc5, _dc6, _dc7, _dc8 = st.columns(4)
+                    _dc5.metric("量比",    f"{_vr:.2f}x" if _vr else "—（需K线）")
+                    _dc6.metric("连板数",  f"{_cons}板" if _cons else "—")
+                    _dc7.metric("MA20",    f"{_ma20:.2f}" if _ma20 else "—（需K线）")
+                    _dc8.metric("MA60",    f"{_ma60:.2f}" if _ma60 else "—（需K线）")
+                    _dc9, _dc10, _dc11, _dc12 = st.columns(4)
+                    _dc9.metric( "是否60日新高", "✅ 是" if _nh  else "否")
+                    _dc10.metric("是否涨停",     "✅ 是" if _lim else "否")
+                    _dc11.metric("游资评分",     f"{_yts}")
+                    _dc12.metric("综合评分",     f"{_comp:.1f}" if _comp else "—（需V4）")
+
+                    # 观察信号
+                    render_entry_signal(
+                        compute_entry_signal(_dr),
+                        name=str(_dr.get("name", "")), code=_dcode,
+                    )
+
+                    # AI 解读
+                    st.markdown("---")
+                    st.markdown("### 🤖 AI解读（规则版·无需大模型）")
+                    _ai = generate_ai_explanation(_dr)
+                    _ai_l, _ai_r = st.columns(2)
+                    with _ai_l:
+                        st.info(f"**📌 入选理由**\n\n{_ai['entry_reasons']}")
+                        st.info(f"**📈 趋势判断**\n\n{_ai['trend']}")
+                        st.info(f"**📊 量能判断**\n\n{_ai['volume']}")
+                        st.info(f"**🔥 人气判断**\n\n{_ai['sentiment']}")
+                    with _ai_r:
+                        st.info(f"**🏷️ 板块/龙头**\n\n{_ai['sector']}")
+                        st.warning(f"**⚠️ 风险提示**\n\n{_ai['risk']}")
+                        st.success(f"**💡 综合结论**\n\n{_ai['conclusion']}")
+                    st.markdown("**📋 一键复制完整解读（可直接发小红书/微信）**")
+                    st.text_area(
+                        "完整文案", value=_ai["full_text"],
+                        height=220, key=f"ai_copy_{_dcode}",
+                    )
 
 # ─────────────────────────────────────────────────────────────────────────
 # Tab 2: 龙头榜
@@ -4783,4 +5176,106 @@ with tab11:
                 data=_exp_df.to_csv(index=False, encoding="utf-8-sig"),
                 file_name=f"v4_report_{pd.Timestamp.today().strftime('%Y%m%d_%H%M')}.csv",
                 mime="text/csv",
+            )
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tab 12: 每日复盘
+# ─────────────────────────────────────────────────────────────────────────
+
+with tab12:
+    st.subheader("📝 每日复盘")
+    st.caption(
+        "基于「实时选股」筛选结果自动生成复盘文案（规则版，无需大模型）| "
+        "支持一键复制小红书 / 微信推文"
+    )
+
+    _r12  = st.session_state.result_df
+    _emo12 = st.session_state.emotion_data
+
+    if _r12.empty:
+        st.info("👈 请先在「实时选股」Tab 执行筛选，再点击下方按钮生成复盘。")
+    else:
+        _cb1, _cb2 = st.columns([1, 3])
+        with _cb1:
+            _gen_btn = st.button("📝 生成今日复盘", key="gen_review_btn",
+                                 type="primary")
+        with _cb2:
+            st.caption(
+                f"当前筛选结果：**{len(_r12)}** 只  |  "
+                "若已在「情绪周期」获取全市场数据，将自动融合情绪评分"
+            )
+
+        if _gen_btn:
+            with st.spinner("正在生成复盘文案…"):
+                _rev = generate_daily_review(
+                    _r12, _emo12 if isinstance(_emo12, dict) else None
+                )
+                st.session_state.daily_review = _rev
+
+        _rev = st.session_state.daily_review
+
+        if not _rev:
+            st.info("点击「生成今日复盘」开始。")
+        elif "error" in _rev:
+            st.error(_rev["error"])
+        else:
+            # ── 情绪概况 ──────────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("### 📈 今日市场情绪概况")
+            _rmc1, _rmc2, _rmc3, _rmc4 = st.columns(4)
+            _rmc1.metric("情绪阶段",   _rev["emo_phase"])
+            _rmc2.metric("情绪参考分", f"{_rev['emo_score']}")
+            _rmc3.metric("强势股数量", f"{_rev['total_cnt']} 只")
+            _rmc4.metric("涨停家数",   f"{_rev['limit_cnt']} 只")
+
+            # ── 今日最强 ──────────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("### 🔥 今日最强前5名")
+            _top5 = _rev.get("top5", pd.DataFrame())
+            if not _top5.empty:
+                try:
+                    _t5disp = pd.DataFrame()
+                    _t5disp["排名"]   = range(1, len(_top5) + 1)
+                    _t5disp["代码"]   = _top5["code"].values
+                    _t5disp["名称"]   = _top5["name"].values
+                    _t5disp["涨跌幅"] = _top5["pct_chg"].map(
+                        lambda x: f"{x:+.2f}%"
+                    ).values
+                    if "yt_score" in _top5.columns:
+                        _t5disp["游资评分"] = _top5["yt_score"].values
+                    if "consec_limit" in _top5.columns:
+                        _t5disp["连板数"] = _top5["consec_limit"].map(
+                            lambda x: f"{int(x)}板" if pd.notna(x) and x > 0 else "—"
+                        ).values
+                    st.dataframe(_t5disp.reset_index(drop=True),
+                                 use_container_width=True, hide_index=True)
+                except Exception:
+                    for ln in _rev.get("top5_lines", []):
+                        st.markdown(ln)
+
+            # ── 共同特征 ──────────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("### ✨ 今日共同特征")
+            for _feat in _rev.get("features", []):
+                st.markdown(f"- {_feat}")
+
+            # ── 风险提示 ──────────────────────────────────────────────
+            st.markdown("### ⚠️ 风险提示")
+            for _rk in _rev.get("risks", []):
+                st.warning(_rk)
+
+            # ── 文案区 ────────────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("### 📋 复盘文案（可直接复制到小红书 / 微信）")
+            st.text_area(
+                "复盘文案",
+                value=_rev.get("xhs", ""),
+                height=340,
+                key="review_copy_area",
+            )
+            st.download_button(
+                label="⬇️ 下载复盘文案 TXT",
+                data=_rev.get("xhs", "").encode("utf-8"),
+                file_name=f"review_{get_beijing_now().strftime('%Y%m%d_%H%M')}.txt",
+                mime="text/plain",
             )
