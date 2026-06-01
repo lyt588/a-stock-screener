@@ -3335,6 +3335,399 @@ def compute_main_themes(
         return []
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# 真正游资核心策略系统
+# ═════════════════════════════════════════════════════════════════════════
+
+# 游资信号配置
+_HOT_MONEY_SIG_CFG: dict = {
+    "龙头接力": {"icon": "🔥", "color": "#ef5350", "desc": "涨停/连板龙头，情绪共振，可关注次日竞价"},
+    "半路突破": {"icon": "⚡", "color": "#ff9800", "desc": "上涨中途放量突破，量价配合，可短线跟踪"},
+    "核心低吸": {"icon": "🧲", "color": "#4caf50", "desc": "低位回调企稳，趋势向好，可在支撑位观察布局"},
+    "弱转强":   {"icon": "🔥", "color": "#ff5722", "desc": "由弱转强放量，可能启动，需确认放量持续性"},
+    "高位风险": {"icon": "⚠️", "color": "#b71c1c", "desc": "高位风险较大，建议回避追高"},
+    "仅观察":   {"icon": "👀", "color": "#78909c", "desc": "当前信号不明确，持续观察，等待更好机会"},
+}
+
+
+def compute_emotion_filter(emotion_data: dict | None) -> dict:
+    """
+    解析情绪周期，返回当前市场情绪状态和允许的游资操作类型。
+
+    情绪阶段 → 允许信号：
+      主升/强修复 → 龙头接力 + 半路突破 + 弱转强 + 核心低吸
+      弱修复/分歧 → 半路突破 + 弱转强 + 核心低吸（禁打板）
+      退潮/冰点   → 仅核心低吸（禁追涨）
+    """
+    try:
+        if not emotion_data or not isinstance(emotion_data, dict):
+            return {
+                "phase":           "未知",
+                "score":           50.0,
+                "is_bullish":      True,
+                "allow_limit_up":  True,
+                "allow_momentum":  True,
+                "allowed_signals": list(_HOT_MONEY_SIG_CFG.keys()),
+                "restriction":     "情绪数据未获取，不做限制",
+            }
+        phase = str(emotion_data.get("phase", "未知"))
+        score = float(emotion_data.get("total", 50) or 50)
+
+        if phase in ("主升", "强修复"):
+            return {
+                "phase": phase, "score": score, "is_bullish": True,
+                "allow_limit_up": True, "allow_momentum": True,
+                "allowed_signals": ["龙头接力","半路突破","弱转强","核心低吸","仅观察"],
+                "restriction": "情绪活跃，各类信号均可参与",
+            }
+        elif phase in ("弱修复", "分歧"):
+            return {
+                "phase": phase, "score": score, "is_bullish": True,
+                "allow_limit_up": False, "allow_momentum": True,
+                "allowed_signals": ["半路突破","弱转强","核心低吸","仅观察"],
+                "restriction": "情绪中性，禁止打板追涨，可关注突破和低吸",
+            }
+        elif phase in ("退潮", "冰点"):
+            return {
+                "phase": phase, "score": score, "is_bullish": False,
+                "allow_limit_up": False, "allow_momentum": False,
+                "allowed_signals": ["核心低吸", "仅观察"],
+                "restriction": "情绪退潮/冰点，禁止追涨，仅允许核心低吸观察",
+            }
+        else:
+            return {
+                "phase": phase, "score": score, "is_bullish": True,
+                "allow_limit_up": True, "allow_momentum": True,
+                "allowed_signals": list(_HOT_MONEY_SIG_CFG.keys()),
+                "restriction": "情绪数据待确认",
+            }
+    except Exception:
+        return {
+            "phase": "未知", "score": 50.0, "is_bullish": True,
+            "allow_limit_up": True, "allow_momentum": True,
+            "allowed_signals": list(_HOT_MONEY_SIG_CFG.keys()),
+            "restriction": "",
+        }
+
+
+def detect_weak_to_strong(row: pd.Series) -> bool:
+    """
+    识别弱转强形态（近似判断，基于现有字段）。
+
+    特征：
+      • 近3日涨幅偏低/为负（[-10, 5]），今日突然放量上涨≥3%
+      • 量比≥2（明显放量）
+      • 连板数≤1（非连板）
+      • MA多头或接近均线支撑位
+    """
+    try:
+        def _f(k, d=0.0):
+            try:    return float(row.get(k) or d)
+            except: return d
+        def _b(k):
+            try:    return bool(row.get(k, False))
+            except: return False
+        def _i(k, d=0):
+            try:    return int(row.get(k) or d)
+            except: return d
+
+        pct    = _f("pct_chg")
+        vr     = _f("vol_ratio")
+        ret3   = _f("ret3")
+        consec = _i("consec_limit")
+        is_hvy = _b("is_heavy")
+
+        return (
+            pct >= 3.0
+            and vr >= 2.0
+            and is_hvy
+            and consec <= 1
+            and ret3 <= 5.0   # 近3日未明显上涨，今日才发力
+        )
+    except Exception:
+        return False
+
+
+def compute_real_hot_money_score(
+    row: pd.Series,
+    hot_sectors: set | None = None,
+    main_themes: list | None = None,
+    emotion_score: float = 50.0,
+) -> float:
+    """
+    真正游资核心评分（0-100），6 个维度。
+
+    ① 情绪分  0-20   ② 板块分  0-20   ③ 龙头分  0-20
+    ④ 资金分  0-20   ⑤ 趋势分  0-20   ⑥ 弱转强分 0-20
+    合计 max 120 → 归一化到 100
+    """
+    try:
+        def _f(k, d=0.0):
+            try:    return float(row.get(k) or d)
+            except: return d
+        def _b(k):
+            try:    return bool(row.get(k, False))
+            except: return False
+        def _i(k, d=0):
+            try:    return int(row.get(k) or d)
+            except: return d
+
+        lim    = _b("is_limit")
+        cons   = _i("consec_limit")
+        vr     = _f("vol_ratio")
+        amt    = _f("amount")
+        is_ma  = _b("is_ma_bull")
+        is_nh  = _b("is_new_high")
+        is_hvy = _b("is_heavy")
+        yt     = _i("yt_score")
+        pct    = _f("pct_chg")
+        ret3   = _f("ret3")
+        sec    = str(row.get("sector", ""))
+
+        # ① 情绪分 (0-20)
+        if   emotion_score >= 80: s1 = 20
+        elif emotion_score >= 60: s1 = 17
+        elif emotion_score >= 45: s1 = 13
+        elif emotion_score >= 30: s1 = 7
+        elif emotion_score >= 15: s1 = 3
+        else:                     s1 = 0
+
+        # ② 板块分 (0-20)：在主线热点加分
+        themes = main_themes or []
+        hot    = hot_sectors or set()
+        if   sec and themes and sec == themes[0]:  s2 = 20
+        elif sec and len(themes) > 1 and sec == themes[1]: s2 = 15
+        elif sec and len(themes) > 2 and sec == themes[2]: s2 = 10
+        elif sec and sec in hot:                   s2 = 8
+        else:                                      s2 = 3
+
+        # ③ 龙头分 (0-20)
+        if lim and cons >= 3 and yt >= 100:   s3 = 20
+        elif lim and cons >= 2:               s3 = 17
+        elif lim:                             s3 = 14
+        elif cons >= 2:                       s3 = 10
+        elif yt >= 150:                       s3 = 14
+        elif yt >= 80:                        s3 = 8
+        else:                                 s3 = 2
+
+        # ④ 资金分 (0-20)
+        if   vr >= 4 and is_hvy and amt >= 5e8:  s4 = 20
+        elif vr >= 3 and is_hvy:                 s4 = 16
+        elif vr >= 2 and amt >= 3e8:             s4 = 12
+        elif vr >= 1.5:                          s4 = 8
+        elif amt >= 1e8:                         s4 = 4
+        else:                                    s4 = 1
+
+        # ⑤ 趋势分 (0-20)
+        s5 = 0
+        if is_ma and is_nh:  s5 = 20
+        elif is_ma:          s5 = 13
+        elif is_nh:          s5 = 10
+        if pct >= 3:         s5 = min(s5 + 4, 20)
+        if ret3 >= 5:        s5 = min(s5 + 2, 20)
+        if s5 == 0:          s5 = 2
+
+        # ⑥ 弱转强分 (0-20)
+        if detect_weak_to_strong(row):
+            s6 = 20
+        elif -3 <= ret3 <= 5 and pct >= 3 and vr >= 1.5:
+            s6 = 12
+        elif 0 < ret3 <= 5 and pct >= 2:
+            s6 = 6
+        else:
+            s6 = 0
+
+        raw   = float(s1 + s2 + s3 + s4 + s5 + s6)
+        score = round(min(raw / 1.2, 100), 1)   # 120满分→100
+        return score
+    except Exception:
+        return 0.0
+
+
+def classify_hot_money_signal(
+    row: pd.Series,
+    hot_sectors: set | None = None,
+    emotion_filter: dict | None = None,
+) -> dict:
+    """
+    基于游资逻辑将个股划分为 6 类观察信号。
+
+    优先级：高位风险 > 弱转强 > 龙头接力 > 半路突破 > 核心低吸 > 仅观察
+    结合情绪过滤器限制信号输出。
+    """
+    try:
+        def _f(k, d=0.0):
+            try:    return float(row.get(k) or d)
+            except: return d
+        def _b(k):
+            try:    return bool(row.get(k, False))
+            except: return False
+        def _i(k, d=0):
+            try:    return int(row.get(k) or d)
+            except: return d
+
+        lim    = _b("is_limit")
+        cons   = _i("consec_limit")
+        vr     = _f("vol_ratio")
+        pct    = _f("pct_chg")
+        turn   = _f("turnover")
+        is_ma  = _b("is_ma_bull")
+        is_nh  = _b("is_new_high")
+        yt     = _i("yt_score")
+        ret3   = _f("ret3")
+
+        ef = emotion_filter or {}
+        allowed = ef.get("allowed_signals", list(_HOT_MONEY_SIG_CFG.keys()))
+
+        def _make(sig_type: str) -> dict:
+            cfg = _HOT_MONEY_SIG_CFG.get(sig_type, _HOT_MONEY_SIG_CFG["仅观察"])
+            return {"signal_type": sig_type, **cfg}
+
+        # ① 危险信号
+        danger = 0
+        if cons >= 6:              danger += 1
+        if vr >= 5 and not lim:    danger += 1
+        if pct >= 7 and not lim:   danger += 1
+        if turn >= 20:             danger += 1
+        if cons >= 4 and vr < 0.8: danger += 1
+        if danger >= 2:
+            return _make("高位风险")
+
+        # ② 弱转强（情绪允许）
+        if detect_weak_to_strong(row) and "弱转强" in allowed:
+            return _make("弱转强")
+
+        # ③ 龙头接力
+        if lim and cons >= 1 and "龙头接力" in allowed:
+            return _make("龙头接力")
+
+        # ④ 半路突破
+        if (4.0 <= pct < 9.5 and not lim
+                and vr >= 1.5
+                and "半路突破" in allowed):
+            return _make("半路突破")
+
+        # ⑤ 核心低吸
+        if (pct < 4.0 and is_ma
+                and (is_nh or yt >= 80 or vr >= 1.5)
+                and "核心低吸" in allowed):
+            return _make("核心低吸")
+
+        return _make("仅观察")
+    except Exception:
+        return {"signal_type": "仅观察", **_HOT_MONEY_SIG_CFG["仅观察"]}
+
+
+def detect_capital_anomaly(
+    row: pd.Series,
+    hot_sectors: set | None = None,
+) -> dict:
+    """
+    检测资金异动信号，包括：涨速异动、成交额放大、板块联动、龙头涨停带动、封单增加（近似）。
+    """
+    try:
+        def _f(k, d=0.0):
+            try:    return float(row.get(k) or d)
+            except: return d
+        def _b(k):
+            try:    return bool(row.get(k, False))
+            except: return False
+        def _i(k, d=0):
+            try:    return int(row.get(k) or d)
+            except: return d
+
+        pct    = _f("pct_chg")
+        vr     = _f("vol_ratio")
+        amt    = _f("amount")
+        lim    = _b("is_limit")
+        cons   = _i("consec_limit")
+        is_hvy = _b("is_heavy")
+        sec    = str(row.get("sector", ""))
+        hs     = hot_sectors or set()
+
+        anomalies: list[str] = []
+
+        if pct >= 5 and is_hvy:
+            anomalies.append("涨速异动")
+        if vr >= 3:
+            anomalies.append(f"成交量放大（量比{vr:.1f}x）")
+        if sec and sec in hs:
+            anomalies.append("板块联动共振")
+        if lim and cons >= 2:
+            anomalies.append(f"龙头{cons}连板带动")
+        if lim and vr >= 2:
+            anomalies.append("封单持续增加（近似）")
+        if amt >= 1e9:
+            anomalies.append(f"成交额{amt/1e8:.0f}亿资金涌入")
+
+        if len(anomalies) >= 3:
+            level, icon = "强", "⚡"
+        elif len(anomalies) >= 2:
+            level, icon = "中", "🔶"
+        elif len(anomalies) >= 1:
+            level, icon = "弱", "🔹"
+        else:
+            level, icon = "无", ""
+
+        return {
+            "has_anomaly": bool(anomalies),
+            "anomalies":   anomalies,
+            "level":       level,
+            "icon":        icon,
+            "summary":     "、".join(anomalies) if anomalies else "无明显异动",
+        }
+    except Exception:
+        return {"has_anomaly": False, "anomalies": [], "level": "无",
+                "icon": "", "summary": "数据不足"}
+
+
+def compute_hot_money_top10(
+    result_df: pd.DataFrame,
+    emotion_data: dict | None = None,
+    top_n: int = 10,
+) -> pd.DataFrame:
+    """
+    计算游资核心 TOP10：附加 real_hot_money_score / hot_money_signal /
+    capital_anomaly / ai_summary 等字段，按评分降序返回。
+    """
+    try:
+        if result_df is None or result_df.empty:
+            return pd.DataFrame()
+
+        ef    = compute_emotion_filter(emotion_data)
+        emo_s = float(ef.get("score", 50))
+        heat  = compute_sector_heat(result_df)
+        hot_s: set = set()
+        if not heat.empty and "板块" in heat.columns:
+            hot_s = set(heat.head(5)["板块"].tolist())
+        themes = compute_main_themes(result_df)
+
+        rows = []
+        for _, r in result_df.iterrows():
+            rhm_s  = compute_real_hot_money_score(r, hot_s, themes, emo_s)
+            hm_sig = classify_hot_money_signal(r, hot_s, ef)
+            anom   = detect_capital_anomaly(r, hot_s)
+            summ   = generate_ai_summary(r, hot_s)
+            rows.append({
+                **r.to_dict(),
+                "real_hot_money_score": rhm_s,
+                "hm_signal_type":       hm_sig["signal_type"],
+                "hm_signal_icon":       hm_sig["icon"],
+                "hm_signal_color":      hm_sig["color"],
+                "hm_signal_desc":       hm_sig["desc"],
+                "capital_anomaly":      anom["summary"],
+                "anomaly_level":        anom["level"],
+                "anomaly_icon":         anom["icon"],
+                "ai_summary":           summ,
+            })
+
+        df = pd.DataFrame(rows)
+        df = df.sort_values("real_hot_money_score", ascending=False).reset_index(drop=True)
+        return df.head(top_n)
+    except Exception:
+        return pd.DataFrame()
+
+
 # ── V4 列默认值 & 安全补全 ───────────────────────────────────────────────
 
 # 所有 V4 stocks DataFrame 必须包含的列及其默认值
@@ -4404,6 +4797,94 @@ with tab1:
             file_name=f"youzhi_{pd.Timestamp.today().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
         )
+
+        # ── 🔥 今日游资核心 TOP10 ─────────────────────────────────────
+        with st.expander("🔥 今日游资核心 TOP10（完整版，仅供技术参考）",
+                         expanded=False):
+            try:
+                _ef10    = compute_emotion_filter(
+                    st.session_state.emotion_data
+                    if isinstance(st.session_state.emotion_data, dict) else None
+                )
+                _emo_sc10 = float(_ef10.get("score", 50))
+                _hm10    = compute_hot_money_top10(result_df, st.session_state.emotion_data)
+
+                # 情绪状态横幅
+                _ep10    = _ef10.get("phase", "未知")
+                _ep_col  = ("#ef5350" if _ef10.get("is_bullish") else "#42a5f5")
+                _ep_rest = _ef10.get("restriction", "")
+                st.markdown(
+                    f"<div style='background:{_ep_col}18;border-left:4px solid {_ep_col};"
+                    f"padding:7px 14px;border-radius:6px;margin-bottom:8px;"
+                    f"font-size:0.87rem'>"
+                    f"😊 情绪：<b style='color:{_ep_col}'>{_ep10}（{_emo_sc10:.0f}分）</b>"
+                    f"&nbsp;&nbsp;{_ep_rest}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+                if _hm10.empty:
+                    st.info("暂无数据，请先在「实时选股」完成筛选。")
+                else:
+                    for _ri10, (_, _tr10) in enumerate(_hm10.iterrows(), 1):
+                        _tc10    = str(_tr10.get("hm_signal_color", "#78909c"))
+                        _ticon10 = str(_tr10.get("hm_signal_icon",  "👀"))
+                        _ttype10 = str(_tr10.get("hm_signal_type",  "仅观察"))
+                        _tdesc10 = str(_tr10.get("hm_signal_desc",  ""))
+                        _tname10 = str(_tr10.get("name",  ""))
+                        _tcode10 = str(_tr10.get("code",  ""))
+                        _trhm10  = float(_tr10.get("real_hot_money_score", 0))
+                        _tsec10  = str(_tr10.get("sector", "—"))
+                        _tpct10  = float(_tr10.get("pct_chg", 0) or 0)
+                        _tsum10  = str(_tr10.get("ai_summary", ""))
+                        _tanom10 = str(_tr10.get("capital_anomaly", ""))
+                        _tanic10 = str(_tr10.get("anomaly_icon", ""))
+                        _risk10  = ""
+                        try:
+                            _rsig = compute_entry_signal(_tr10)
+                            _risk_pts = _rsig.get("risk_points", [])
+                            _risk10 = " | ".join(_risk_pts[:2]) if _risk_pts else ""
+                        except Exception:
+                            pass
+
+                        _anom_row = (
+                            f"&nbsp;|&nbsp;{_tanic10} {_tanom10}"
+                            if _tanom10 and _tanom10 != "无明显异动" else ""
+                        )
+                        _risk_row = (
+                            f"<div style='margin-top:3px;color:#ff8a80;"
+                            f"font-size:0.8rem'>⚠️ {_risk10}</div>"
+                            if _risk10 else ""
+                        )
+                        _card10 = (
+                            f"<div style='background:{_tc10}10;border-left:5px solid {_tc10};"
+                            f"padding:10px 16px;border-radius:8px;margin:5px 0'>"
+                            f"<div style='display:flex;justify-content:space-between;"
+                            f"align-items:center'>"
+                            f"<span style='font-size:1.0rem;font-weight:700;color:{_tc10}'>"
+                            f"{_ri10}. {_ticon10} {_tname10}（{_tcode10}）</span>"
+                            f"<span style='color:{_tc10};font-size:0.83rem;font-weight:600'>"
+                            f"{_ttype10}&nbsp;·&nbsp;游资核心分&nbsp;<b>{_trhm10}</b></span>"
+                            f"</div>"
+                            f"<div style='margin-top:4px;color:#aaa;font-size:0.82rem'>"
+                            f"📊 {_tsec10}"
+                            f"&nbsp;|&nbsp;涨幅 {_tpct10:+.1f}%"
+                            f"{_anom_row}</div>"
+                            f"<div style='margin-top:3px;color:#ddd;font-size:0.88rem'>"
+                            f"{_tsum10}</div>"
+                            f"{_risk_row}"
+                            f"<div style='margin-top:3px;color:#bbb;font-size:0.8rem'>"
+                            f"💡 {_tdesc10}</div>"
+                            f"</div>"
+                        )
+                        st.markdown(_card10, unsafe_allow_html=True)
+
+                st.caption(
+                    "⚠️ 以上内容为技术指标综合观察参考，不构成任何投资建议。"
+                    "投资有风险，入市需谨慎，请结合自身情况独立判断。"
+                )
+            except Exception as _e10:
+                st.caption(f"TOP10 模块加载异常（不影响其他功能）：{_e10}")
 
         # ── 个股详情区 ────────────────────────────────────────────────
         st.markdown("---")
