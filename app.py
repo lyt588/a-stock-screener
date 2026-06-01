@@ -3733,23 +3733,28 @@ with tab1:
         disp = build_display_df(result_df, need_hist)
         st.dataframe(disp, use_container_width=True, height=600)
 
-        if need_hist:
-            with st.expander("🎯 观察信号详情（仅供技术参考，不构成投资建议）",
-                             expanded=False):
-                _sig_limit = 20
-                _sig_rows  = list(result_df.iterrows())[:_sig_limit]
-                if len(result_df) > _sig_limit:
-                    st.caption(
-                        f"仅展示前 {_sig_limit} 只，完整信号见「观察信号」列"
-                    )
-                for _, _sr in _sig_rows:
-                    _sig = compute_entry_signal(_sr)
-                    render_entry_signal(
-                        _sig,
-                        name=str(_sr.get("name", "")),
-                        code=str(_sr.get("code", "")),
-                    )
-                    st.divider()
+        with st.expander("🎯 观察信号详情（仅供技术参考，不构成投资建议）",
+                         expanded=False):
+            if not need_hist:
+                st.info(
+                    "💡 当前为「宽松」模式，未加载历史K线，"
+                    "观察信号依据有限（仅涨跌幅/成交额）。\n"
+                    "切换为「标准」或「强势」模式并重新筛选，可获得更完整的信号判断。"
+                )
+            _sig_limit = 20
+            _sig_rows  = list(result_df.iterrows())[:_sig_limit]
+            if len(result_df) > _sig_limit:
+                st.caption(
+                    f"仅展示前 {_sig_limit} 只，完整信号见「观察信号」列"
+                )
+            for _, _sr in _sig_rows:
+                _sig = compute_entry_signal(_sr)
+                render_entry_signal(
+                    _sig,
+                    name=str(_sr.get("name", "")),
+                    code=str(_sr.get("code", "")),
+                )
+                st.divider()
 
         with st.expander("⭐ 快速添加到自选股"):
             wl_codes = load_watchlist()
@@ -3971,6 +3976,26 @@ with tab5:
             render_kline_chart(chart_code, chart_name, count=kline_count)
         with ct2:
             render_intraday_chart(chart_code, chart_name)
+
+        # ── 观察信号卡片 ──────────────────────────────────────────────
+        st.markdown("---")
+        # 优先从筛选结果取（含历史指标），否则回退到实时行情（部分指标）
+        _sig_row5: pd.Series = pd.Series(dtype=object)
+        if not _r5.empty and "code" in _r5.columns:
+            _m5 = _r5[_r5["code"].astype(str) == chart_code]
+            if not _m5.empty:
+                _sig_row5 = _m5.iloc[0]
+        if _sig_row5.empty:
+            _rt5 = fetch_all_realtime((chart_code,))
+            if not _rt5.empty:
+                _sig_row5 = _rt5.iloc[0]
+        if not _sig_row5.empty:
+            render_entry_signal(
+                compute_entry_signal(_sig_row5),
+                name=chart_name, code=chart_code,
+            )
+        else:
+            st.caption("⚠️ 无法获取行情数据，暂不显示观察信号")
     else:
         st.info("请输入股票代码，或从列表中选择，查看 K 线图和分时图。")
 
