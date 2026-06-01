@@ -3079,6 +3079,262 @@ def generate_daily_review(result_df: pd.DataFrame,
         return {"error": f"复盘生成失败：{_e}"}
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# 观察优先级 TOP 排名系统
+# ═════════════════════════════════════════════════════════════════════════
+
+def compute_priority_score(
+    row: pd.Series,
+    hot_sectors: set | None = None,
+    emotion_score: float = 50.0,
+) -> float:
+    """
+    计算观察优先级综合评分（0-100）。
+
+    各维度及满分：
+      游资评分   15 | 是否涨停  15 | 连板数     10 | 情绪周期  10
+      量比       10 | 成交额    10 | MA多头      8 | 60日新高   7
+      板块热点    8 | 换手率     5 | 近3日涨幅   5
+    合计 ~103，最终 clip 到 [0, 100]
+    """
+    try:
+        def _f(k, d=0.0):
+            try:    return float(row.get(k) or d)
+            except: return d
+        def _b(k):
+            try:    return bool(row.get(k, False))
+            except: return False
+        def _i(k, d=0):
+            try:    return int(row.get(k) or d)
+            except: return d
+
+        yt    = _i("yt_score")
+        lim   = _b("is_limit")
+        cons  = _i("consec_limit")
+        vr    = _f("vol_ratio")
+        amt   = _f("amount")
+        is_ma = _b("is_ma_bull")
+        is_nh = _b("is_new_high")
+        turn  = _f("turnover")
+        ret3  = _f("ret3")
+        sec   = str(row.get("sector", ""))
+
+        s = 0.0
+
+        # 游资评分 (0-15)
+        s += min(yt / 200.0 * 15, 15)
+
+        # 涨停 (0-15)
+        if lim: s += 15
+
+        # 连板 (0-10): 1板=3, 2板=6, 3板=9, ≥4板=10
+        s += min(cons * 3.0, 10)
+
+        # 情绪周期 (0-10)
+        s += max(0, emotion_score) / 100.0 * 10
+
+        # 量比 (0-10)
+        s += min(vr / 3.0 * 10, 10)
+
+        # 成交额 (0-10): <1亿→0, 1亿→2, 3亿→5, 5亿→7, ≥10亿→10
+        if   amt >= 1e9: s += 10
+        elif amt >= 5e8: s += 7
+        elif amt >= 3e8: s += 5
+        elif amt >= 1e8: s += 2
+
+        # MA多头 (0-8)
+        if is_ma: s += 8
+
+        # 60日新高 (0-7)
+        if is_nh: s += 7
+
+        # 板块热点 (0-8)
+        if hot_sectors:
+            hs = list(hot_sectors)
+            if sec and sec in hs[:1]:   s += 8   # 第一热点板块
+            elif sec and sec in hs[1:]: s += 4   # 次热点板块
+
+        # 换手率 (0-5): 5-15% 最佳
+        if   5 <= turn <= 15: s += 5
+        elif 3 <= turn <  5:  s += 3
+        elif 15 < turn <= 20: s += 3
+        elif turn > 0:        s += 1
+
+        # 近3日涨幅 (0-5): 3-12% 最佳，>20% 不加分
+        if   3 <= ret3 <= 12: s += 5
+        elif 12 < ret3 <= 20: s += 3
+        elif 0 < ret3 < 3:    s += 2
+
+        return round(float(min(max(s, 0), 100)), 1)
+    except Exception:
+        return 0.0
+
+
+# 梯队配置（星级 / 颜色 / 标签）
+_PRIORITY_LEVELS = [
+    {"min": 85, "stars": "⭐⭐⭐⭐⭐", "label": "第一梯队", "color": "#ef5350"},
+    {"min": 70, "stars": "⭐⭐⭐⭐",   "label": "第二梯队", "color": "#ff9800"},
+    {"min": 55, "stars": "⭐⭐⭐",     "label": "第三梯队", "color": "#42a5f5"},
+    {"min":  0, "stars": "⭐",         "label": "仅观察",   "color": "#78909c"},
+]
+
+
+def get_priority_level(score: float) -> dict:
+    """根据优先级评分返回梯队配置 dict"""
+    for lvl in _PRIORITY_LEVELS:
+        if score >= lvl["min"]:
+            return lvl
+    return _PRIORITY_LEVELS[-1]
+
+
+def generate_ai_summary(row: pd.Series, hot_sectors: set | None = None) -> str:
+    """生成单只股票的一句话 AI 观察摘要（规则版）"""
+    try:
+        def _f(k, d=0.0):
+            try:    return float(row.get(k) or d)
+            except: return d
+        def _b(k):
+            try:    return bool(row.get(k, False))
+            except: return False
+        def _i(k, d=0):
+            try:    return int(row.get(k) or d)
+            except: return d
+
+        lim   = _b("is_limit")
+        cons  = _i("consec_limit")
+        vr    = _f("vol_ratio")
+        is_ma = _b("is_ma_bull")
+        is_nh = _b("is_new_high")
+        yt    = _i("yt_score")
+        pct   = _f("pct_chg")
+        sec   = str(row.get("sector", ""))
+        amt   = _f("amount")
+
+        parts = []
+
+        # 板块方向
+        if sec and sec not in ("", "—", "nan"):
+            in_hot = hot_sectors and sec in hot_sectors
+            parts.append(f"{'🔥 ' if in_hot else ''}{sec}方向")
+
+        # 核心特征
+        if lim and cons >= 3:
+            parts.append(f"涨停{cons}连板强势")
+        elif lim:
+            parts.append("涨停封板")
+        elif pct >= 7:
+            parts.append(f"涨幅{pct:.1f}%接近涨停")
+
+        if vr >= 3 and is_ma:
+            parts.append("量价齐升")
+        elif vr >= 2:
+            parts.append(f"量比{vr:.1f}x放量")
+
+        if is_nh:
+            parts.append("突破60日新高")
+
+        if yt >= 150:
+            parts.append("游资高度关注")
+        elif yt >= 80:
+            parts.append("游资跟踪")
+
+        if amt >= 1e9:
+            parts.append(f"成交额{amt/1e8:.0f}亿")
+
+        summary = "，".join(parts) + "。" if parts else "基础条件达标，持续跟踪。"
+        return summary[:80]   # 限制长度
+    except Exception:
+        return "数据不足，持续观察。"
+
+
+def compute_top_candidates(
+    result_df: pd.DataFrame,
+    emotion_score: float = 50.0,
+    top_n: int = 5,
+) -> pd.DataFrame:
+    """
+    计算全部筛选结果的观察优先级评分，返回按评分降序的 DataFrame，
+    已附加 priority_score / priority_level / priority_stars / priority_color 列。
+    """
+    try:
+        if result_df is None or result_df.empty:
+            return pd.DataFrame()
+
+        # 先算板块热度用于热点加分
+        _heat = compute_sector_heat(result_df)
+        hot_sectors: set = set()
+        if not _heat.empty and "板块" in _heat.columns:
+            hot_sectors = set(_heat.head(3)["板块"].tolist())
+
+        rows = []
+        for _, r in result_df.iterrows():
+            ps   = compute_priority_score(r, hot_sectors, emotion_score)
+            lvl  = get_priority_level(ps)
+            summ = generate_ai_summary(r, hot_sectors)
+            rows.append({
+                **r.to_dict(),
+                "priority_score": ps,
+                "priority_stars": lvl["stars"],
+                "priority_label": lvl["label"],
+                "priority_color": lvl["color"],
+                "ai_summary":     summ,
+            })
+
+        df = pd.DataFrame(rows)
+        df = df.sort_values("priority_score", ascending=False).reset_index(drop=True)
+        return df.head(top_n)
+    except Exception:
+        return pd.DataFrame()
+
+
+def compute_main_themes(
+    result_df: pd.DataFrame,
+    top_df: pd.DataFrame | None = None,
+) -> list[str]:
+    """
+    统计今日主线热点方向（最多 3 个），基于：
+    1. 筛选结果中出现次数最多的板块
+    2. 平均游资评分最高的板块
+    3. TOP5 中占比最高的板块
+    返回去重后的板块列表。
+    """
+    try:
+        if result_df is None or result_df.empty:
+            return []
+        if "sector" not in result_df.columns:
+            return []
+
+        themes: list[str] = []
+
+        # 出现次数最多的板块
+        _cnt = result_df["sector"].dropna().value_counts()
+        if not _cnt.empty:
+            themes.append(_cnt.index[0])
+
+        # 平均游资评分最高的板块
+        if "yt_score" in result_df.columns:
+            _avg = (
+                result_df[result_df["sector"].notna()]
+                .groupby("sector")["yt_score"]
+                .mean()
+                .sort_values(ascending=False)
+            )
+            if not _avg.empty and _avg.index[0] not in themes:
+                themes.append(_avg.index[0])
+
+        # TOP5 中出现最多的板块
+        if top_df is not None and not top_df.empty and "sector" in top_df.columns:
+            _top_cnt = top_df["sector"].dropna().value_counts()
+            if not _top_cnt.empty and _top_cnt.index[0] not in themes:
+                themes.append(_top_cnt.index[0])
+
+        # 过滤无效
+        themes = [t for t in themes if t and t not in ("—", "nan", "")]
+        return themes[:3]
+    except Exception:
+        return []
+
+
 # ── V4 列默认值 & 安全补全 ───────────────────────────────────────────────
 
 # 所有 V4 stocks DataFrame 必须包含的列及其默认值
@@ -4031,6 +4287,78 @@ with tab1:
     if result_df.empty:
         st.info("👈 在左侧设置筛选条件，点击「开始筛选」运行。")
     else:
+        # ── 🔥 今日重点观察 TOP5 ──────────────────────────────────────
+        try:
+            _emo_sc = float(
+                st.session_state.emotion_data.get("total", 50)
+                if isinstance(st.session_state.emotion_data, dict) else 50
+            )
+            _top_df   = compute_top_candidates(result_df, _emo_sc, top_n=5)
+            _themes   = compute_main_themes(result_df, _top_df)
+
+            if not _top_df.empty:
+                # 主线方向横幅
+                if _themes:
+                    _th_str = " / ".join(_themes)
+                    st.markdown(
+                        f"<div style='background:#1e2130;border-radius:6px;"
+                        f"padding:8px 14px;margin-bottom:6px;font-size:0.9rem'>"
+                        f"🔥 <b>今日主线：</b>"
+                        f"<span style='color:#ff9800'>{_th_str}</span>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                st.markdown(
+                    "<div style='font-size:1.05rem;font-weight:700;"
+                    "margin:4px 0 6px 0'>🔥 今日重点观察 TOP5</div>",
+                    unsafe_allow_html=True,
+                )
+
+                for _ri, (_, _tr) in enumerate(_top_df.iterrows(), 1):
+                    _tc     = str(_tr.get("priority_color", "#78909c"))
+                    _tstars = str(_tr.get("priority_stars", "⭐"))
+                    _tlabel = str(_tr.get("priority_label", "仅观察"))
+                    _tname  = str(_tr.get("name", ""))
+                    _tcode  = str(_tr.get("code", ""))
+                    _tsc    = float(_tr.get("priority_score", 0))
+                    _tsec   = str(_tr.get("sector", "—"))
+                    _tsum   = str(_tr.get("ai_summary", ""))
+                    _tsig   = compute_entry_signal(_tr)
+                    _tsig_icon = _tsig.get("signal_icon", "👀")
+                    _tsig_type = _tsig.get("signal_type", "仅观察不追")
+                    _tpct   = float(_tr.get("pct_chg", 0) or 0)
+
+                    st.markdown(
+                        f"<div style='background:{_tc}12;border-left:5px solid {_tc};"
+                        f"padding:10px 16px;border-radius:8px;margin:4px 0'>"
+                        f"<div style='display:flex;justify-content:space-between;"
+                        f"align-items:center'>"
+                        f"<span style='font-size:1.05rem;font-weight:700;color:{_tc}'>"
+                        f"{_ri}. {_tname}（{_tcode}）</span>"
+                        f"<span style='color:{_tc};font-size:0.85rem'>"
+                        f"{_tstars}&nbsp;{_tlabel}&nbsp;｜&nbsp;"
+                        f"评分&nbsp;<b>{_tsc}</b></span>"
+                        f"</div>"
+                        f"<div style='margin-top:5px;color:#aaa;font-size:0.83rem'>"
+                        f"{_tsig_icon} {_tsig_type}"
+                        f"&nbsp;|&nbsp;📊 {_tsec}"
+                        f"&nbsp;|&nbsp;涨幅 {_tpct:+.1f}%"
+                        f"</div>"
+                        f"<div style='margin-top:4px;color:#ddd;font-size:0.9rem'>"
+                        f"{_tsum}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                st.caption(
+                    "⚠️ 以上优先级为技术指标综合观察参考，不构成任何投资建议。"
+                    "投资有风险，入市需谨慎。"
+                )
+                st.markdown("---")
+        except Exception as _top_err:
+            st.caption(f"TOP5 模块加载异常（不影响其他功能）：{_top_err}")
+
         st.subheader(f"筛选结果  共 {len(result_df)} 只（按 {sort_by} 降序）")
         disp = build_display_df(result_df, need_hist)
         st.dataframe(disp, use_container_width=True, height=600)
