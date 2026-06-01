@@ -3201,11 +3201,19 @@ with st.sidebar:
     st.caption(f"💡 {mc['desc']}")
 
     # ── 股票池状态面板 ────────────────────────────────────────────────────
-    pool_sz    = st.session_state.get("pool_size",    0)
-    rt_cnt     = st.session_state.get("rt_count",     0)
-    flt_cnt    = st.session_state.get("filter_count", 0)
-    pool_src   = st.session_state.get("pool_source",  "未加载")
-    pool_break = st.session_state.get("pool_break",   {})
+    # pool_sz 直接从缓存函数取，确保首次加载就显示正确数字
+    try:
+        _live_pool = get_stock_list()
+        pool_sz    = len(_live_pool)
+        pool_src   = _POOL_INFO.get("source", "stock_codes.csv")
+        pool_break = _count_by_market(_live_pool)
+    except Exception:
+        pool_sz    = st.session_state.get("pool_size",   0)
+        pool_src   = st.session_state.get("pool_source", "未知")
+        pool_break = st.session_state.get("pool_break",  {})
+    # rt_cnt / flt_cnt 来自 session_state（筛选后才有值）
+    rt_cnt  = st.session_state.get("rt_count",     0)
+    flt_cnt = st.session_state.get("filter_count", 0)
     pool_color = "#ef5350" if pool_sz < 5000 and pool_sz > 0 else "#26a69a"
 
     st.markdown(
@@ -3408,6 +3416,8 @@ with tab1:
             result.index += 1
             st.session_state.result_df = result
             st.session_state.need_hist = need_hist_flag
+        # 强制重渲染，确保侧边栏立即读到最新 rt_count / filter_count
+        st.rerun()
 
     result_df = st.session_state.result_df
     need_hist = st.session_state.need_hist
