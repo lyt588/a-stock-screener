@@ -2531,6 +2531,254 @@ def _gen_risk_reasons(row: pd.Series, rsk: dict) -> list:
     return reasons
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# 买点提示模块（交易观察信号，不构成投资建议）
+# ═════════════════════════════════════════════════════════════════════════
+
+# 信号类型配置：颜色、图标、仓位参考
+_SIGNAL_CFG: dict = {
+    "打板观察": {
+        "color": "#ef5350", "icon": "🎯",
+        "pos": "轻仓", "pos_desc": "如参与打板，建议轻仓试错，严格止损",
+    },
+    "半路观察": {
+        "color": "#ff9800", "icon": "📊",
+        "pos": "轻仓", "pos_desc": "量价配合尚可，轻仓参与或继续观察均可",
+    },
+    "低吸观察": {
+        "color": "#4caf50", "icon": "📉",
+        "pos": "轻仓", "pos_desc": "趋势向好但未启动，可在支撑位轻仓布局",
+    },
+    "仅观察不追": {
+        "color": "#78909c", "icon": "👀",
+        "pos": "观察", "pos_desc": "暂时观察，等待更强信号后再考虑参与",
+    },
+    "高风险回避": {
+        "color": "#b71c1c", "icon": "🚫",
+        "pos": "谨慎", "pos_desc": "存在较多风险因素，暂时回避",
+    },
+}
+
+
+def compute_entry_signal(
+    row: pd.Series,
+    sector_heat: float = 0.5,
+    emotion_score: float = 50.0,
+) -> dict:
+    """
+    交易观察信号（仅供技术分析参考，不构成投资建议）。
+
+    信号优先级：高风险回避 > 打板观察 > 半路观察 > 低吸观察 > 仅观察不追
+
+    判断维度：涨跌幅、换手率、量比、成交额、连板数、涨停、60日新高、
+              MA多头、近3日涨幅、板块热度、游资评分、市场情绪
+    """
+    try:
+        pct      = float(row.get("pct_chg",      0) or 0)
+        turnover = float(row.get("turnover",      0) or 0)
+        vr       = float(row.get("vol_ratio")     or 0)
+        amount   = float(row.get("amount",        0) or 0)
+        consec   = int(row.get("consec_limit",    0) or 0)
+        is_limit = bool(row.get("is_limit",      False))
+        is_nh    = bool(row.get("is_new_high",   False))
+        is_ma    = bool(row.get("is_ma_bull",    False))
+        is_heavy = bool(row.get("is_heavy",      False))
+        ret3     = float(row.get("ret3")          or 0)
+        yt_score = int(row.get("yt_score",        0) or 0)
+
+        # ── ① 危险信号汇总 ────────────────────────────────────────────
+        danger: list = []
+        if consec >= 6:
+            danger.append(f"{consec}连板高位，炸板/获利回吐风险大")
+        if vr >= 5.0 and not is_limit:
+            danger.append(f"量比{vr:.1f}x但未封板，主力可能借量出货")
+        if pct >= 7.0 and not is_limit:
+            danger.append(f"涨幅{pct:.1f}%却未涨停，大阴线转折风险")
+        if emotion_score < 30:
+            danger.append("市场情绪退潮/冰点，整体胜率偏低")
+        if turnover >= 20:
+            danger.append(f"换手率{turnover:.0f}%过高，筹码极度松散")
+        if consec >= 4 and vr < 0.8:
+            danger.append("连板缩量，上攻动力不足，注意缩量炸板")
+
+        # 2条以上危险直接标高风险
+        if len(danger) >= 2:
+            return _make_signal(
+                "高风险回避", score=max(5, 20 - len(danger) * 5),
+                obs=[f"⚠️ {d}" for d in danger],
+                risk=danger,
+            )
+
+        # ── ② 打板信号 ───────────────────────────────────────────────
+        board_s = 0
+        board_obs:  list = []
+        board_risk: list = []
+        if is_limit:
+            board_s += 40; board_obs.append("涨停封板中")
+        if consec >= 2:
+            board_s += min(consec * 8, 24); board_obs.append(f"{consec}连板强势延续")
+        if sector_heat >= 0.7:
+            board_s += 15; board_obs.append("板块热度高，联动效应明显")
+        if emotion_score >= 45:
+            board_s += 10; board_obs.append("市场情绪支撑")
+        if yt_score >= 60:
+            board_s += 10; board_obs.append(f"游资评分{yt_score}，资金关注度高")
+        if is_nh:
+            board_s += 8;  board_obs.append("突破60日新高，历史压力已消化")
+        if turnover >= 15:
+            board_risk.append("换手率偏高，注意被砸风险")
+        if consec >= 4:
+            board_risk.append("高连板炸板概率上升，止损要严格")
+        if not board_risk:
+            board_risk.append("打板存在竞争，须设好价位和止损")
+
+        if is_limit and board_s >= 50:
+            return _make_signal(
+                "打板观察", score=min(board_s, 100),
+                obs=board_obs, risk=board_risk,
+            )
+
+        # ── ③ 半路信号 ───────────────────────────────────────────────
+        mid_s = 0
+        mid_obs:  list = []
+        mid_risk: list = []
+        if 4.0 <= pct < 9.5 and not is_limit:
+            mid_s += 30; mid_obs.append(f"涨幅{pct:.1f}%，上涨中途")
+        if vr >= 1.5:
+            mid_s += 20; mid_obs.append(f"量比{vr:.1f}x，有效放量")
+        if is_ma:
+            mid_s += 15; mid_obs.append("均线多头排列，趋势向好")
+        if is_heavy:
+            mid_s += 8;  mid_obs.append("成交量显著放大")
+        if 5 <= turnover <= 12:
+            mid_s += 10; mid_obs.append("换手率适中，筹码较健康")
+        elif turnover > 12:
+            mid_risk.append(f"换手率{turnover:.0f}%偏高，短线抛压")
+        if sector_heat >= 0.5:
+            mid_s += 8;  mid_obs.append("板块热度尚可")
+        if pct >= 7:
+            mid_risk.append("涨幅偏大，追入安全边际不足")
+        if not mid_risk:
+            mid_risk.append("追入需注意当日高低点，设好止损位")
+
+        if mid_s >= 50:
+            return _make_signal(
+                "半路观察", score=min(mid_s, 100),
+                obs=mid_obs, risk=mid_risk,
+            )
+
+        # ── ④ 低吸信号 ───────────────────────────────────────────────
+        dip_s = 0
+        dip_obs:  list = []
+        dip_risk: list = []
+        if 0 <= pct < 4:
+            dip_s += 20; dip_obs.append("今日低位整理，成本相对合理")
+        if is_ma:
+            dip_s += 25; dip_obs.append("均线多头，趋势结构未破坏")
+        if is_nh:
+            dip_s += 15; dip_obs.append("60日新高附近，历史压力已突破")
+        if yt_score >= 40:
+            dip_s += 15; dip_obs.append(f"游资评分{yt_score}，有资金关注迹象")
+        if ret3 > 5:
+            dip_s += 10; dip_obs.append(f"近3日累计{ret3:.1f}%，动量在线")
+        if 0.5 <= vr <= 2:
+            dip_s += 5;  dip_obs.append("量能温和，未见大卖压")
+        if amount < 2e8:
+            dip_risk.append("成交额不足2亿，流动性偏低")
+        if not is_ma:
+            dip_risk.append("均线尚未形成多头，需等企稳信号")
+        if not dip_risk:
+            dip_risk.append("需等待明确企稳信号，避免接飞刀")
+
+        if dip_s >= 45:
+            return _make_signal(
+                "低吸观察", score=min(dip_s, 100),
+                obs=dip_obs, risk=dip_risk,
+            )
+
+        # ── ⑤ 单条危险信号 ────────────────────────────────────────────
+        if len(danger) == 1:
+            return _make_signal(
+                "高风险回避", score=15,
+                obs=[f"⚠️ {danger[0]}"],
+                risk=danger,
+            )
+
+        # ── ⑥ 默认：仅观察不追 ────────────────────────────────────────
+        return _make_signal(
+            "仅观察不追", score=30,
+            obs=["当前信号不够明确", "可加入自选股持续跟踪",
+                 "等待量价配合更好的时机出现"],
+            risk=["信号不明，追入胜率偏低"],
+        )
+
+    except Exception:
+        return _make_signal(
+            "仅观察不追", score=0,
+            obs=["数据不足，无法判断（需开启历史K线）"],
+            risk=["数据缺失"],
+        )
+
+
+def _make_signal(sig_type: str, score: int, obs: list, risk: list) -> dict:
+    """构造信号结果 dict，统一格式"""
+    cfg = _SIGNAL_CFG.get(sig_type, _SIGNAL_CFG["仅观察不追"])
+    return {
+        "signal_type":  sig_type,
+        "signal_color": cfg["color"],
+        "signal_icon":  cfg["icon"],
+        "pos_level":    cfg["pos"],
+        "pos_desc":     cfg["pos_desc"],
+        "score":        max(0, min(score, 100)),
+        "obs_points":   obs,
+        "risk_points":  risk,
+    }
+
+
+def render_entry_signal(sig: dict, name: str = "", code: str = ""):
+    """渲染交易观察信号卡片（Streamlit UI）"""
+    _type  = sig.get("signal_type",  "仅观察不追")
+    _color = sig.get("signal_color", "#78909c")
+    _icon  = sig.get("signal_icon",  "👀")
+    _pos   = sig.get("pos_level",    "观察")
+    _pdesc = sig.get("pos_desc",     "")
+    _score = sig.get("score",        0)
+    _obs   = sig.get("obs_points",   [])
+    _risk  = sig.get("risk_points",  [])
+
+    _title = f"{_icon} {_type}"
+    if name:
+        _title += f"  —  {name}（{code}）"
+
+    st.markdown(
+        f"<div style='background:{_color}18;border-left:5px solid {_color};"
+        f"padding:12px 18px;border-radius:8px;margin:6px 0 10px 0'>"
+        f"<span style='font-size:1.25rem;font-weight:700;color:{_color}'>"
+        f"{_title}</span><br>"
+        f"<span style='color:#bbb;font-size:0.85rem'>"
+        f"综合评分 {_score} &nbsp;｜&nbsp; 仓位参考：<b style='color:{_color}'>{_pos}</b>"
+        f"</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    _cl, _cr = st.columns(2)
+    with _cl:
+        st.markdown("**✅ 观察要点**")
+        for _o in _obs:
+            st.markdown(f"- {_o}")
+    with _cr:
+        st.markdown("**⚠️ 风险提示**")
+        for _r in _risk:
+            st.markdown(f"- {_r}")
+
+    st.caption(f"📌 {_pdesc}")
+    st.caption(
+        "⚠️ 以上内容为技术指标观察参考，**不构成任何投资建议**。"
+        "投资有风险，入市需谨慎，请结合自身情况独立判断。"
+    )
+
+
 # ── V4 列默认值 & 安全补全 ───────────────────────────────────────────────
 
 # 所有 V4 stocks DataFrame 必须包含的列及其默认值
@@ -3228,6 +3476,16 @@ def build_display_df(result_df: pd.DataFrame, need_hist: bool) -> pd.DataFrame:
             lambda x: f"{int(x)}板" if pd.notna(x) and x > 0 else "—"
         )
         disp["60日新高"]  = result_df["is_new_high"].map(_yn)
+        # 观察信号列（简洁版，详情在展开区查看）
+        try:
+            _sigs = [
+                f"{compute_entry_signal(r)['signal_icon']} "
+                f"{compute_entry_signal(r)['signal_type']}"
+                for _, r in result_df.iterrows()
+            ]
+            disp["观察信号"] = _sigs
+        except Exception:
+            pass
     return disp
 
 
@@ -3474,6 +3732,24 @@ with tab1:
         st.subheader(f"筛选结果  共 {len(result_df)} 只（按 {sort_by} 降序）")
         disp = build_display_df(result_df, need_hist)
         st.dataframe(disp, use_container_width=True, height=600)
+
+        if need_hist:
+            with st.expander("🎯 观察信号详情（仅供技术参考，不构成投资建议）",
+                             expanded=False):
+                _sig_limit = 20
+                _sig_rows  = list(result_df.iterrows())[:_sig_limit]
+                if len(result_df) > _sig_limit:
+                    st.caption(
+                        f"仅展示前 {_sig_limit} 只，完整信号见「观察信号」列"
+                    )
+                for _, _sr in _sig_rows:
+                    _sig = compute_entry_signal(_sr)
+                    render_entry_signal(
+                        _sig,
+                        name=str(_sr.get("name", "")),
+                        code=str(_sr.get("code", "")),
+                    )
+                    st.divider()
 
         with st.expander("⭐ 快速添加到自选股"):
             wl_codes = load_watchlist()
