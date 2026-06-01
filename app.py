@@ -3728,6 +3728,336 @@ def compute_hot_money_top10(
         return pd.DataFrame()
 
 
+# ── V5 新增辅助函数 ──────────────────────────────────────────────────────
+
+def calculate_abnormal_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算每只股票的异动评分和异动类型。
+    返回 df 附加列：abnormal_score(0-100), abnormal_types(list→str), abnormal_reason
+    """
+    try:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        rows = []
+        for _, r in df.iterrows():
+            try:
+                def _f(k, d=0.0):
+                    try: return float(r.get(k) or d)
+                    except: return d
+                def _b(k):
+                    try: return bool(r.get(k, False))
+                    except: return False
+                def _i(k, d=0):
+                    try: return int(r.get(k) or d)
+                    except: return d
+
+                code   = str(r.get("code", ""))
+                pct    = _f("pct_chg")
+                vr     = _f("vol_ratio")
+                amt    = _f("amount")
+                turn   = _f("turnover")
+                ret3   = _f("ret3")
+                lim    = _b("is_limit")
+                is_nh  = _b("is_new_high")
+                yt     = _i("yt_score")
+                cons   = _i("consec_limit")
+                is_hvy = _b("is_heavy")
+
+                # 判断板块类型（创业板/科创板 涨停阈值20%）
+                is_kc = code.startswith(("3", "688"))
+                near_limit = pct >= 19.0 if is_kc else pct >= 9.3
+
+                score = 0.0
+                types: list[str] = []
+                reasons: list[str] = []
+
+                if lim:
+                    score += 30; types.append("涨停"); reasons.append("涨停封板")
+                elif near_limit:
+                    score += 22; types.append("接近涨停"); reasons.append(f"涨幅{pct:.1f}%接近涨停")
+                elif pct >= 5:
+                    score += 15; types.append("涨幅异动"); reasons.append(f"涨幅{pct:.1f}%")
+
+                if vr >= 3:
+                    score += 15; types.append("放量异动"); reasons.append(f"量比{vr:.1f}x")
+                elif vr >= 2:
+                    score += 8;  types.append("量能放大"); reasons.append(f"量比{vr:.1f}x")
+
+                if amt >= 1e9:
+                    score += 15; types.append("巨量成交"); reasons.append(f"成交额{amt/1e8:.0f}亿")
+                elif amt >= 5e8:
+                    score += 10; types.append("成交额异动"); reasons.append(f"成交额{amt/1e8:.1f}亿")
+
+                if turn >= 15:
+                    score += 12; types.append("高换手"); reasons.append(f"换手率{turn:.1f}%")
+                elif turn >= 8:
+                    score += 8;  types.append("换手异动"); reasons.append(f"换手率{turn:.1f}%")
+
+                if is_nh:
+                    score += 12; types.append("新高突破"); reasons.append("创60日新高")
+                if yt >= 150:
+                    score += 15; types.append("游资聚集"); reasons.append(f"游资评分{yt}")
+                elif yt >= 80:
+                    score += 10; types.append("游资关注"); reasons.append(f"游资评分{yt}")
+                if cons >= 2:
+                    score += 8;  types.append(f"{cons}连板"); reasons.append(f"{cons}连板")
+                if is_hvy and score < 20:
+                    score += 5
+
+                # 高风险标记
+                is_hr = ret3 >= 20 or turn >= 30
+                if is_hr:
+                    types.append("⚠️高风险")
+                    reasons.append(f"近3日涨{ret3:.0f}%或换手{turn:.0f}%过高")
+
+                score = round(min(score, 100), 1)
+                rows.append({
+                    **r.to_dict(),
+                    "abnormal_score":  score,
+                    "abnormal_types":  " | ".join(types) if types else "—",
+                    "abnormal_reason": "；".join(reasons) if reasons else "—",
+                    "is_high_risk":    is_hr,
+                })
+            except Exception:
+                rows.append({**r.to_dict(), "abnormal_score": 0.0,
+                             "abnormal_types": "—", "abnormal_reason": "—", "is_high_risk": False})
+
+        if not rows:
+            return pd.DataFrame()
+        out = pd.DataFrame(rows)
+        return out.sort_values("abnormal_score", ascending=False).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def calculate_market_temperature(df: pd.DataFrame) -> dict:
+    """
+    根据筛选结果计算市场情绪温度（0-100）。
+    维度：涨停占比(30) + 平均涨幅(20) + 放量占比(20) + 量比均值(15) + 游资活跃(15)
+    """
+    try:
+        if df is None or df.empty:
+            return {"temperature": 50, "level": "震荡", "desc": "数据不足，默认中性",
+                    "style": "均衡操作，控制仓位", "color": "#ffeb3b"}
+
+        n = len(df)
+
+        def _scol(col, d=0):
+            if col not in df.columns: return pd.Series([d] * n)
+            return df[col].fillna(d)
+
+        # ① 涨停占比 (0-30)
+        lim_n  = int(_scol("is_limit", False).sum())
+        t1     = min(lim_n / max(n, 1) * 200, 30)   # 15% 涨停率→满分
+
+        # ② 平均涨幅 (0-20)
+        avg_pct = float(_scol("pct_chg", 0).mean())
+        t2     = min(max(avg_pct / 7 * 20, 0), 20)
+
+        # ③ 放量股占比 (0-20)
+        if "vol_ratio" in df.columns:
+            heavy_n = (df["vol_ratio"].fillna(0) >= 1.5).sum()
+            t3 = min(heavy_n / max(n, 1) * 40, 20)
+        else:
+            t3 = 10
+
+        # ④ 量比均值 (0-15)
+        if "vol_ratio" in df.columns:
+            avg_vr = float(df["vol_ratio"].dropna().mean() or 1)
+            t4 = min(max((avg_vr - 1) / 2 * 15, 0), 15)
+        else:
+            t4 = 7
+
+        # ⑤ 游资活跃度 (0-15)
+        if "yt_score" in df.columns:
+            avg_yt = float(df["yt_score"].dropna().mean() or 0)
+            t5 = min(avg_yt / 150 * 15, 15)
+        else:
+            t5 = 5
+
+        temp = round(t1 + t2 + t3 + t4 + t5, 1)
+        temp = max(0, min(temp, 100))
+
+        if   temp >= 80: level, desc, style, color = "高潮🔥", "市场极度亢奋，追高风险高", "严格控仓，回避追高", "#ef5350"
+        elif temp >= 60: level, desc, style, color = "回暖🌤", "情绪积极，做多力量增强",    "正常仓位，优选龙头",  "#ff9800"
+        elif temp >= 40: level, desc, style, color = "震荡⚖️", "多空均衡，分化明显",        "轻仓灵活，重视选股",  "#ffeb3b"
+        elif temp >= 20: level, desc, style, color = "退潮🌊", "情绪偏弱，资金撤退",        "轻仓或空仓，保存实力", "#42a5f5"
+        else:            level, desc, style, color = "冰点❄️", "市场极度悲观，机会极少",    "空仓观望为主",        "#78909c"
+
+        return {"temperature": temp, "level": level, "desc": desc,
+                "style": style, "color": color,
+                "breakdown": {"涨停占比分": round(t1,1), "平均涨幅分": round(t2,1),
+                               "放量占比分": round(t3,1), "量比均值分": round(t4,1),
+                               "游资活跃分": round(t5,1)}}
+    except Exception:
+        return {"temperature": 50, "level": "震荡", "desc": "计算异常",
+                "style": "均衡操作", "color": "#ffeb3b", "breakdown": {}}
+
+
+def generate_market_broadcast(
+    df: pd.DataFrame,
+    sector_df: pd.DataFrame | None = None,
+    emotion_data: dict | None = None,
+) -> dict:
+    """规则版 AI 盘中播报，生成自然语言播报文本"""
+    try:
+        if df is None or df.empty:
+            return {"error": "无筛选数据，请先在「实时选股」执行筛选"}
+
+        today_str = get_beijing_now().strftime("%m月%d日 %H:%M")
+
+        # 情绪
+        emo_phase = "—"
+        emo_score = 50
+        if emotion_data and isinstance(emotion_data, dict):
+            emo_phase = str(emotion_data.get("phase", "—"))
+            emo_score = int(emotion_data.get("total", 50) or 50)
+        temp_d = calculate_market_temperature(df)
+
+        # 主线
+        themes = compute_main_themes(df)
+        themes_str = " / ".join(themes) if themes else "暂无明显主线"
+
+        # 异动TOP
+        abn_df = calculate_abnormal_signals(df)
+        top3_names: list[str] = []
+        if not abn_df.empty:
+            for _, r in abn_df.head(3).iterrows():
+                nm = str(r.get("name", ""))
+                ty = str(r.get("abnormal_types", ""))
+                if nm:
+                    top3_names.append(f"{nm}（{ty}）")
+
+        # 风险
+        risks: list[str] = []
+        if not abn_df.empty and "is_high_risk" in abn_df.columns:
+            hr_n = int(abn_df["is_high_risk"].sum())
+            if hr_n > 0:
+                risks.append(f"共 {hr_n} 只高风险股票，高位换手过高，追高需谨慎")
+        if emo_score >= 75:
+            risks.append("市场情绪偏热，注意情绪反转风险")
+        if not risks:
+            risks.append("市场整体风险可控，保持正常仓位管理")
+
+        # 组装短播报
+        top3_str = "、".join([n.split("（")[0] for n in top3_names]) if top3_names else "暂无明显异动"
+        brief = (
+            f"【{today_str}盘中播报】"
+            f"当前市场情绪{temp_d['level']}（温度{temp_d['temperature']:.0f}分），"
+            f"今日主线方向：{themes_str}。"
+            f"{top3_str}等个股出现异动，资金关注度提升。"
+            f"风险提示：{'；'.join(risks)}。"
+            f"本内容仅作为市场观察参考，不构成投资建议。"
+        )
+
+        # 详细版
+        detail_lines = [
+            f"📢 【{today_str} AI盘中播报】",
+            "",
+            f"📊 市场状态：{temp_d['level']}，情绪温度 {temp_d['temperature']:.0f} 分",
+            f"   {temp_d['desc']}",
+            "",
+            f"🔥 今日主线方向：{themes_str}",
+            "",
+            "⚡ 异动重点关注：",
+            *[f"   · {n}" for n in top3_names],
+            "",
+            "⚠️ 风险提示：",
+            *[f"   · {r}" for r in risks],
+            "",
+            "💡 操作风格参考：" + temp_d["style"],
+            "",
+            "─────────────────────────",
+            "以上内容为技术指标观察参考，不构成任何投资建议。",
+            "投资有风险，入市需谨慎，请结合自身情况独立判断。",
+        ]
+        detail = "\n".join(detail_lines)
+
+        return {
+            "brief":       brief,
+            "detail":      detail,
+            "themes":      themes,
+            "top3":        top3_names,
+            "risks":       risks,
+            "temp":        temp_d,
+            "emo_phase":   emo_phase,
+            "emo_score":   emo_score,
+        }
+    except Exception as e:
+        return {"error": f"播报生成失败：{e}"}
+
+
+def enrich_watchlist_with_realtime_data(
+    wl_codes: list,
+    result_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    获取自选股实时数据，并从 result_df 或重新计算游资评分/观察信号/异动类型。
+    返回富化后的 DataFrame，包含：code, name, price, pct_chg, amount, turnover,
+    vol_ratio, yt_score, signal_type, signal_icon, abnormal_types, ai_summary, in_anomaly
+    """
+    try:
+        if not wl_codes:
+            return pd.DataFrame()
+
+        # 先拉实时行情
+        rt = fetch_all_realtime(tuple(wl_codes))
+        if rt.empty:
+            return pd.DataFrame()
+
+        stock_dict = get_stock_list()
+
+        # 如果 result_df 有数据，优先从中提取完整指标
+        rdmap: dict = {}
+        if result_df is not None and not result_df.empty and "code" in result_df.columns:
+            for _, rr in result_df.iterrows():
+                rdmap[str(rr["code"])] = rr.to_dict()
+
+        # 计算 result_df 中的异动
+        abn_codes: set = set()
+        if result_df is not None and not result_df.empty:
+            abn_df_tmp = calculate_abnormal_signals(result_df)
+            if not abn_df_tmp.empty and "code" in abn_df_tmp.columns:
+                high_abn = abn_df_tmp[abn_df_tmp["abnormal_score"] >= 40]
+                abn_codes = set(high_abn["code"].astype(str).tolist())
+
+        rows: list = []
+        for _, rr in rt.iterrows():
+            code = str(rr.get("code", ""))
+            full = rdmap.get(code, rr.to_dict())
+            row_s = pd.Series(full)
+
+            sig = compute_entry_signal(row_s)
+            summ = generate_ai_summary(row_s)
+            abn_types = "—"
+            try:
+                abn_tmp = calculate_abnormal_signals(pd.DataFrame([full]))
+                if not abn_tmp.empty:
+                    abn_types = str(abn_tmp.iloc[0].get("abnormal_types", "—"))
+            except Exception:
+                pass
+
+            rows.append({
+                "code":          code,
+                "name":          str(rr.get("name", stock_dict.get(code, code))),
+                "price":         float(rr.get("price", 0) or 0),
+                "pct_chg":       float(rr.get("pct_chg", 0) or 0),
+                "amount":        float(rr.get("amount", 0) or 0),
+                "turnover":      float(rr.get("turnover", 0) or 0),
+                "vol_ratio":     float(full.get("vol_ratio", 0) or 0),
+                "yt_score":      int(full.get("yt_score", 0) or 0),
+                "signal_type":   sig.get("signal_type", "仅观察不追"),
+                "signal_icon":   sig.get("signal_icon", "👀"),
+                "abnormal_types":abn_types,
+                "ai_summary":    summ,
+                "in_anomaly":    code in abn_codes,
+            })
+
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame()
+
+
 # ── V4 列默认值 & 安全补全 ───────────────────────────────────────────────
 
 # 所有 V4 stocks DataFrame 必须包含的列及其默认值
@@ -4635,6 +4965,7 @@ if "pool_break"     not in st.session_state: st.session_state.pool_break     = {
 if "v4_result"      not in st.session_state: st.session_state.v4_result      = {}
 if "selected_stock" not in st.session_state: st.session_state.selected_stock = ""
 if "daily_review"   not in st.session_state: st.session_state.daily_review   = {}
+if "broadcast_result" not in st.session_state: st.session_state.broadcast_result = {}
 
 
 # ── 自动刷新注入 ──────────────────────────────────────────────────────────
@@ -4646,10 +4977,12 @@ if auto_refresh:
 
 # ── Tab 布局 ──────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
-    "📊 实时选股", "🏆 龙头榜", "🔥 板块热度", "⭐ 自选股", "📈 个股图表",
-    "🤖 AI龙头", "😊 情绪周期", "🔔 竞价监控", "📋 龙虎榜", "🎯 游资行为",
-    "🚀 V4综合分析", "📝 每日复盘",
+tab1, tab13, tab14, tab4, tab15, tab12, tab3, tab2, tab8, tab5, tab6, tab7, tab9, tab10, tab11 = st.tabs([
+    "📊 实时选股",    "⚡ 异动监控",    "📢 AI播报",
+    "⭐ 自选股",      "🌡️ 情绪温度计", "📝 AI复盘",
+    "🔥 板块热度",    "🏆 龙头榜",      "🔔 竞价监控",
+    "📈 个股图表",    "🤖 AI龙头",      "😊 情绪周期",
+    "📋 龙虎榜",      "🎯 游资行为",    "🚀 V4综合分析",
 ])
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -5056,74 +5389,95 @@ with tab3:
 # ─────────────────────────────────────────────────────────────────────────
 
 with tab4:
-    st.subheader("⭐ 自选股管理")
+    st.subheader("⭐ 自选股")
 
-    wl = load_watchlist()
-    st.caption(f"当前自选股：**{len(wl)}** 只，数据保存于 `{WATCHLIST_FILE}`")
+    _wl4 = load_watchlist()
+    st.caption(f"当前自选股：**{len(_wl4)}** 只，保存于 `{WATCHLIST_FILE}`")
 
-    col_add, col_btn = st.columns([3, 1])
-    with col_add:
-        new_code = st.text_input(
+    _wl_c1, _wl_c2 = st.columns([3, 1])
+    with _wl_c1:
+        _new_code4 = st.text_input(
             "添加股票代码（6位）", placeholder="如 600519",
-            key="wl_add_input", label_visibility="collapsed",
+            key="wl4_add_input", label_visibility="collapsed",
         )
-    with col_btn:
-        if st.button("添加", key="wl_add_btn"):
-            code_clean = new_code.strip().zfill(6)
-            if re.match(r"^\d{6}$", code_clean):
-                add_to_watchlist(code_clean)
-                st.success(f"已添加 {code_clean}")
+    with _wl_c2:
+        if st.button("添加", key="wl4_add_btn"):
+            _cc4 = _new_code4.strip().zfill(6)
+            if re.match(r"^\d{6}$", _cc4):
+                add_to_watchlist(_cc4)
+                st.success(f"已添加 {_cc4}")
                 st.rerun()
             else:
                 st.error("请输入有效的6位股票代码")
 
-    if not wl:
+    if not _wl4:
         st.info("自选股为空，请手动添加，或在「实时选股」结果中点击添加按钮。")
     else:
-        wl_rt      = fetch_all_realtime(tuple(wl))
-        stock_dict = get_stock_list()
+        try:
+            _wl_rich = enrich_watchlist_with_realtime_data(
+                _wl4, st.session_state.result_df
+            )
+        except Exception:
+            _wl_rich = pd.DataFrame()
 
-        if wl_rt.empty:
-            st.warning("无法获取自选股行情（可能为非交易时段）")
-            for c in wl:
-                c1, c2 = st.columns([5, 1])
-                c1.write(f"**{c}** {stock_dict.get(c, '')}")
-                if c2.button("删除", key=f"rm_{c}"):
-                    remove_from_watchlist(c)
+        # 异动提醒
+        if not _wl_rich.empty and "in_anomaly" in _wl_rich.columns:
+            _anom_wl = _wl_rich[_wl_rich["in_anomaly"] == True]
+            if not _anom_wl.empty:
+                _anom_names = " / ".join(_anom_wl["name"].tolist()[:5])
+                st.markdown(
+                    f"<div style='background:#ef535025;border-left:5px solid #ef5350;"
+                    f"padding:8px 14px;border-radius:6px;font-size:0.9rem'>"
+                    f"🔥 <b style='color:#ef5350'>自选股异动提醒：</b>{_anom_names}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+        if not _wl_rich.empty:
+            # 富化表格展示
+            _wl_disp = pd.DataFrame()
+            _wl_disp["代码"]     = _wl_rich["code"]
+            _wl_disp["名称"]     = _wl_rich["name"]
+            _wl_disp["最新价"]   = _wl_rich["price"].map(lambda x: f"¥{x:.2f}")
+            _wl_disp["涨跌幅"]   = _wl_rich["pct_chg"].map(lambda x: f"{x:+.2f}%")
+            _wl_disp["成交额"]   = _wl_rich["amount"].map(
+                lambda x: f"{x/1e8:.2f}亿" if x > 0 else "—"
+            )
+            _wl_disp["换手率"]   = _wl_rich["turnover"].map(
+                lambda x: f"{x:.1f}%" if x > 0 else "—"
+            )
+            _wl_disp["量比"]     = _wl_rich["vol_ratio"].map(
+                lambda x: f"{x:.1f}x" if x > 0 else "—"
+            )
+            _wl_disp["游资评分"] = _wl_rich["yt_score"]
+            _wl_disp["观察信号"] = _wl_rich.apply(
+                lambda r: f"{r['signal_icon']} {r['signal_type']}", axis=1
+            )
+            _wl_disp["异动类型"] = _wl_rich["abnormal_types"]
+            _wl_disp["AI简评"]   = _wl_rich["ai_summary"].map(
+                lambda x: x[:30] + "…" if len(str(x)) > 30 else x
+            )
+            st.dataframe(_wl_disp.reset_index(drop=True),
+                         use_container_width=True, height=400)
+
+            # 删除按钮
+            st.markdown("**删除自选股**")
+            _del_cols = st.columns(5)
+            for _di, _dc in enumerate(_wl4):
+                _dn = _wl_rich[_wl_rich["code"] == _dc]["name"].values
+                _dn = _dn[0] if len(_dn) else _dc
+                if _del_cols[_di % 5].button(f"🗑 {_dn}", key=f"wl4_del_{_dc}"):
+                    remove_from_watchlist(_dc)
                     st.rerun()
         else:
-            # 补充不在行情中的自选股（只显示代码+名称）
-            rt_codes = set(wl_rt["code"].astype(str).tolist())
-            missing  = [c for c in wl if c not in rt_codes]
-
-            st.markdown("---")
-            hdr = st.columns([1, 2, 1, 1, 1, 1])
-            for i, h in enumerate(["代码", "名称", "最新价", "涨跌幅", "成交额", "操作"]):
-                hdr[i].markdown(f"**{h}**")
-
-            for _, row in wl_rt.iterrows():
-                code     = str(row["code"])
-                pct      = row["pct_chg"]
-                pct_str  = f"{pct:+.2f}%" if pd.notna(pct) else "-"
-                color    = "#ef5350" if pd.notna(pct) and pct >= 0 else "#26a69a"
-                amt_str  = f"{row['amount']/1e8:.2f} 亿" if pd.notna(row["amount"]) else "-"
-                c1, c2, c3, c4, c5, c6 = st.columns([1, 2, 1, 1, 1, 1])
-                c1.write(code)
-                c2.write(f"**{row['name']}**")
-                c3.write(f"{row['price']:.2f}")
-                c4.markdown(f"<span style='color:{color}'>{pct_str}</span>",
-                            unsafe_allow_html=True)
-                c5.write(amt_str)
-                if c6.button("🗑️", key=f"del_{code}"):
-                    remove_from_watchlist(code)
-                    st.rerun()
-
-            for c in missing:
-                c1, c2, _, _, _, c6 = st.columns([1, 2, 1, 1, 1, 1])
-                c1.write(c)
-                c2.write(f"**{stock_dict.get(c, c)}**")
-                if c6.button("🗑️", key=f"del_{c}"):
-                    remove_from_watchlist(c)
+            # fallback: 无实时数据
+            st.warning("无法获取自选股行情（可能为非交易时段）")
+            stock_dict_wl = get_stock_list()
+            for _wlc in _wl4:
+                _wlc1, _wlc2 = st.columns([5, 1])
+                _wlc1.write(f"**{_wlc}** {stock_dict_wl.get(_wlc, '')}")
+                if _wlc2.button("删除", key=f"wl4rm_{_wlc}"):
+                    remove_from_watchlist(_wlc)
                     st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -6088,3 +6442,231 @@ with tab12:
                 file_name=f"review_{get_beijing_now().strftime('%Y%m%d_%H%M')}.txt",
                 mime="text/plain",
             )
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tab 13: 异动监控
+# ─────────────────────────────────────────────────────────────────────────
+
+with tab13:
+    st.subheader("⚡ 异动监控")
+    st.caption(
+        "基于最近一次筛选结果检测异动股票 | "
+        "涨停 / 接近涨停 / 放量 / 巨量成交 / 高换手 / 新高 / 游资聚集 / 连板"
+    )
+
+    _r13 = st.session_state.result_df
+    if _r13.empty:
+        st.info("👈 请先在「实时选股」Tab 执行筛选，异动监控将自动分析结果。")
+    else:
+        try:
+            _abn13 = calculate_abnormal_signals(_r13)
+            if _abn13.empty:
+                st.warning("暂无异动数据。")
+            else:
+                # 统计
+                _ac1, _ac2, _ac3, _ac4 = st.columns(4)
+                _ac1.metric("异动股数量", f"{len(_abn13)} 只")
+                _ac2.metric("涨停",       f"{int(_r13.get('is_limit', pd.Series(dtype=bool)).fillna(False).sum() if 'is_limit' in _r13.columns else 0)} 只")
+                _ac3.metric("高风险",     f"{int(_abn13['is_high_risk'].sum())} 只")
+                _ac4.metric("最高异动分", f"{float(_abn13['abnormal_score'].max()):.1f}")
+
+                # 类型分布
+                _type_counts: dict = {}
+                for _tystr in _abn13["abnormal_types"].dropna():
+                    for _t in str(_tystr).split(" | "):
+                        _t = _t.strip()
+                        if _t and _t != "—":
+                            _type_counts[_t] = _type_counts.get(_t, 0) + 1
+                if _type_counts:
+                    _tc_sorted = sorted(_type_counts.items(), key=lambda x: -x[1])[:8]
+                    st.markdown("**异动类型分布**")
+                    _tcols = st.columns(min(len(_tc_sorted), 4))
+                    for _tci, (_tn, _tv) in enumerate(_tc_sorted):
+                        _tcols[_tci % 4].metric(_tn, f"{_tv} 只")
+
+                st.markdown("---")
+                st.markdown(f"### 异动 TOP{min(20, len(_abn13))}")
+
+                # 展示表格
+                _abn_disp = pd.DataFrame()
+                _abn_disp["排名"]     = range(1, len(_abn13.head(20)) + 1)
+                _abn_disp["代码"]     = _abn13.head(20)["code"].values
+                _abn_disp["名称"]     = _abn13.head(20)["name"].values
+                _abn_disp["异动分"]   = _abn13.head(20)["abnormal_score"].values
+                _abn_disp["异动类型"] = _abn13.head(20)["abnormal_types"].values
+                _abn_disp["涨跌幅"]   = _abn13.head(20)["pct_chg"].map(
+                    lambda x: f"{x:+.2f}%"
+                ).values
+                if "yt_score" in _abn13.columns:
+                    _abn_disp["游资评分"] = _abn13.head(20)["yt_score"].values
+                _abn_disp["异动原因"] = _abn13.head(20)["abnormal_reason"].values
+                st.dataframe(_abn_disp.reset_index(drop=True),
+                             use_container_width=True, height=500)
+
+                # 卡片展示 TOP5
+                st.markdown("### ⚡ 异动详情 TOP5")
+                for _ai13, (_, _ar13) in enumerate(_abn13.head(5).iterrows(), 1):
+                    _asc13  = float(_ar13.get("abnormal_score", 0))
+                    _aty13  = str(_ar13.get("abnormal_types", "—"))
+                    _arn13  = str(_ar13.get("abnormal_reason", "—"))
+                    _anm13  = str(_ar13.get("name", ""))
+                    _acd13  = str(_ar13.get("code", ""))
+                    _ahr13  = bool(_ar13.get("is_high_risk", False))
+                    _apc13  = float(_ar13.get("pct_chg", 0) or 0)
+                    _card_color = "#ef5350" if _asc13 >= 60 else ("#ff9800" if _asc13 >= 40 else "#42a5f5")
+                    if _ahr13: _card_color = "#b71c1c"
+                    _acard = (
+                        f"<div style='background:{_card_color}12;border-left:5px solid {_card_color};"
+                        f"padding:10px 16px;border-radius:8px;margin:4px 0'>"
+                        f"<div style='font-weight:700;color:{_card_color};font-size:1rem'>"
+                        f"{_ai13}. {_anm13}（{_acd13}）"
+                        f"<span style='font-size:0.85rem;margin-left:10px'>异动分 {_asc13}</span></div>"
+                        f"<div style='color:#aaa;font-size:0.83rem;margin-top:3px'>"
+                        f"📊 {_aty13} &nbsp;|&nbsp; 涨幅 {_apc13:+.1f}%"
+                        + ("&nbsp;|&nbsp;⚠️ 高风险" if _ahr13 else "")
+                        + f"</div>"
+                        f"<div style='color:#ccc;font-size:0.85rem;margin-top:3px'>{_arn13}</div>"
+                        f"</div>"
+                    )
+                    st.markdown(_acard, unsafe_allow_html=True)
+
+                st.caption("⚠️ 以上为技术指标观察参考，不构成任何投资建议。投资有风险，入市需谨慎。")
+        except Exception as _e13:
+            st.error(f"异动监控加载异常：{_e13}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tab 14: AI播报
+# ─────────────────────────────────────────────────────────────────────────
+
+with tab14:
+    st.subheader("📢 AI盘中播报")
+    st.caption("基于筛选结果 + 板块热度 + 情绪数据，规则引擎生成自然语言播报（零成本）")
+
+    _r14 = st.session_state.result_df
+    if _r14.empty:
+        st.info("👈 请先在「实时选股」执行筛选后，再生成播报。")
+    else:
+        _bc1, _bc2 = st.columns([1, 3])
+        with _bc1:
+            _gen14 = st.button("📢 生成盘中播报", key="gen_broadcast_btn", type="primary")
+        with _bc2:
+            st.caption(f"当前筛选结果：**{len(_r14)}** 只")
+
+        if _gen14:
+            with st.spinner("正在生成播报…"):
+                try:
+                    _sh14  = compute_sector_heat(_r14)
+                    _emo14 = st.session_state.emotion_data
+                    _bc    = generate_market_broadcast(_r14, _sh14, _emo14)
+                    st.session_state["broadcast_result"] = _bc
+                except Exception as _be:
+                    st.session_state["broadcast_result"] = {"error": str(_be)}
+
+        _bc_res = st.session_state.get("broadcast_result", {})
+
+        if not _bc_res:
+            st.info("点击「生成盘中播报」开始。")
+        elif "error" in _bc_res:
+            st.error(_bc_res["error"])
+        else:
+            _temp14 = _bc_res.get("temp", {})
+            _t14    = float(_temp14.get("temperature", 50))
+            _tlvl14 = str(_temp14.get("level", "—"))
+            _tclr14 = str(_temp14.get("color", "#78909c"))
+
+            # 情绪状态卡片
+            st.markdown(
+                f"<div style='background:{_tclr14}20;border-left:5px solid {_tclr14};"
+                f"padding:10px 16px;border-radius:8px;margin-bottom:8px'>"
+                f"<span style='font-size:1.3rem;font-weight:700;color:{_tclr14}'>"
+                f"情绪温度：{_t14:.0f}分 {_tlvl14}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            # 主线 + 风险
+            _th14 = _bc_res.get("themes", [])
+            _rk14 = _bc_res.get("risks", [])
+            _bl14, _br14 = st.columns(2)
+            with _bl14:
+                st.markdown("**🔥 今日主线方向**")
+                if _th14:
+                    for _t in _th14:
+                        st.markdown(f"- {_t}")
+                else:
+                    st.caption("暂无明显主线")
+            with _br14:
+                st.markdown("**⚠️ 风险提示**")
+                for _r in _rk14:
+                    st.warning(_r)
+
+            # 播报文案区
+            st.markdown("---")
+            st.markdown("**📋 简洁版播报（适合微信群/朋友圈）**")
+            st.text_area("简洁播报", value=_bc_res.get("brief", ""), height=120, key="bc_brief")
+
+            st.markdown("**📋 详细版播报（适合复盘文档）**")
+            st.text_area("详细播报", value=_bc_res.get("detail", ""), height=260, key="bc_detail")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tab 15: 情绪温度计
+# ─────────────────────────────────────────────────────────────────────────
+
+with tab15:
+    st.subheader("🌡️ 情绪温度计")
+    st.caption("综合涨停占比 / 平均涨幅 / 放量占比 / 量比均值 / 游资活跃度计算市场温度（0-100）")
+
+    _r15 = st.session_state.result_df
+    if _r15.empty:
+        st.info("👈 请先在「实时选股」执行筛选。")
+    else:
+        try:
+            _thermo = calculate_market_temperature(_r15)
+            _tval   = float(_thermo.get("temperature", 50))
+            _tlvl   = str(_thermo.get("level", "—"))
+            _tdesc  = str(_thermo.get("desc", ""))
+            _tstyle = str(_thermo.get("style", ""))
+            _tclr   = str(_thermo.get("color", "#ffeb3b"))
+            _tbkd   = _thermo.get("breakdown", {})
+
+            # 温度大卡片
+            st.markdown(
+                f"<div style='background:{_tclr}25;border-left:6px solid {_tclr};"
+                f"padding:16px 20px;border-radius:10px;margin-bottom:10px'>"
+                f"<div style='font-size:2.4rem;font-weight:700;color:{_tclr}'>"
+                f"{_tval:.0f} 分 — {_tlvl}</div>"
+                f"<div style='color:#ccc;margin-top:4px'>{_tdesc}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            # 进度条
+            st.progress(int(_tval))
+
+            # 操作风格提示
+            st.info(f"💡 **操作风格参考**：{_tstyle}（仅供观察参考，不构成投资建议）")
+
+            # 分项得分
+            if _tbkd:
+                st.markdown("---")
+                st.markdown("**各维度得分**")
+                _bk_cols = st.columns(len(_tbkd))
+                for _bci, (_bk, _bv) in enumerate(_tbkd.items()):
+                    _bk_cols[_bci].metric(_bk, f"{_bv:.1f}")
+
+            # 与情绪周期对比
+            _emo15 = st.session_state.emotion_data
+            if isinstance(_emo15, dict) and _emo15.get("total"):
+                st.markdown("---")
+                st.markdown("**📊 与情绪周期评分对比**")
+                _ev15 = int(_emo15.get("total", 0))
+                _ep15 = str(_emo15.get("phase", "—"))
+                _ec1, _ec2 = st.columns(2)
+                _ec1.metric("情绪温度计", f"{_tval:.0f} 分", help="基于当前筛选结果计算")
+                _ec2.metric("情绪周期评分", f"{_ev15} 分", help=f"阶段：{_ep15}，来自「情绪周期」Tab")
+
+            st.caption("⚠️ 情绪温度仅基于当前筛选结果估算，与全市场实际情绪可能存在偏差。仅作观察参考。")
+        except Exception as _e15:
+            st.error(f"情绪温度计加载异常：{_e15}")
