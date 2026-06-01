@@ -8,11 +8,62 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 import requests
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+# ── 北京时间（Asia/Shanghai）工具 ─────────────────────────────────────────
+# 使用 ZoneInfo（Python 3.9+）或 pytz 兜底，确保云端始终返回 UTC+8
+try:
+    from zoneinfo import ZoneInfo as _ZI
+    _BEIJING_TZ = _ZI("Asia/Shanghai")
+except ImportError:
+    try:
+        import pytz as _pytz
+        _BEIJING_TZ = _pytz.timezone("Asia/Shanghai")
+    except ImportError:
+        import datetime as _dt_mod
+        _BEIJING_TZ = _dt_mod.timezone(_dt_mod.timedelta(hours=8))
+
+
+def get_beijing_now() -> datetime:
+    """返回当前北京时间（Asia/Shanghai），不受服务器系统时区影响"""
+    return datetime.now(_BEIJING_TZ)
+
+
+def get_trading_status(dt: datetime) -> tuple:
+    """
+    根据北京时间返回 A 股交易状态。
+    返回值：(状态文字, 颜色hex, 是否处于交易时段)
+
+    时间段划分（A股规则）：
+      09:15-09:25  集合竞价
+      09:25-09:30  竞价结束/等待开盘
+      09:30-11:30  上午交易
+      11:30-13:00  午间休市
+      13:00-14:57  下午交易
+      14:57-15:00  尾盘竞价
+      15:00+       已收盘
+      周六/周日    休市
+    """
+    # 周末
+    if dt.weekday() >= 5:
+        return "休市（周末）", "#78909c", False
+
+    t = dt.hour * 60 + dt.minute    # 当天分钟数，便于比较
+
+    if   t <  9*60 + 15:  return "盘前",           "#78909c", False
+    elif t <  9*60 + 25:  return "集合竞价",        "#ff9800", False
+    elif t <  9*60 + 30:  return "竞价结束/等待开盘", "#ffeb3b", False
+    elif t < 11*60 + 30:  return "上午交易中",      "#26a69a", True
+    elif t < 13*60:       return "午间休市",         "#78909c", False
+    elif t < 14*60 + 57:  return "下午交易中",      "#26a69a", True
+    elif t < 15*60:       return "尾盘竞价",         "#ff9800", True
+    else:                  return "已收盘",           "#78909c", False
+
 
 # ── matplotlib 中文字体兼容配置 ──────────────────────────────────────────
 try:
@@ -1881,18 +1932,13 @@ def compute_emotion_cycle(rt_df: pd.DataFrame) -> dict:
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_auction_data(codes_tuple: tuple) -> pd.DataFrame:
     """
-    竞价监控：拉取实时行情，标记当前竞价阶段。
-    09:15-09:30 = 集合竞价，14:57-15:00 = 尾盘竞价，其余 = 连续竞价。
+    竞价监控：拉取实时行情，用北京时间标记竞价阶段和快照时间。
+    时间始终使用 Asia/Shanghai，不依赖服务器系统时区。
     """
     try:
-        now    = pd.Timestamp.now()
-        h, m   = now.hour, now.minute
-        if h == 9 and 15 <= m <= 30:
-            phase = "集合竞价"
-        elif h == 14 and m >= 57:
-            phase = "尾盘竞价"
-        else:
-            phase = "连续竞价"
+        bj_now = get_beijing_now()                       # 北京时间
+        phase, _, _ = get_trading_status(bj_now)         # 当前交易阶段
+        snapshot_str = bj_now.strftime("%H:%M:%S (北京)")
 
         rt_df = fetch_all_realtime(codes_tuple)
         if rt_df.empty:
@@ -1903,11 +1949,11 @@ def fetch_auction_data(codes_tuple: tuple) -> pd.DataFrame:
         if df.empty:
             return pd.DataFrame()
 
-        df["竞价阶段"]   = phase
-        df["快照时间"]   = now.strftime("%H:%M:%S")
-        df["竞价涨幅"]   = df["pct_chg"].map(lambda x: f"{x:+.2f}%")
+        df["竞价阶段"]     = phase
+        df["行情快照时间"] = snapshot_str            # 明确标注是快照时间
+        df["竞价涨幅"]     = df["pct_chg"].map(lambda x: f"{x:+.2f}%")
         df["竞价量(万手)"] = (df["volume"] / 10000).map(lambda x: f"{x:.1f}")
-        df["竞价额(亿)"]  = (df["amount"] / 1e8).map(lambda x: f"{x:.2f}")
+        df["竞价额(亿)"]   = (df["amount"] / 1e8).map(lambda x: f"{x:.2f}")
         return df.sort_values("pct_chg", ascending=False).reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
@@ -3848,17 +3894,52 @@ with tab7:
 with tab8:
     st.subheader("🔔 竞价监控")
     st.caption(
-        "09:15-09:30 集合竞价 | 14:57-15:00 尾盘竞价 | "
+        "时间均使用北京时间（Asia/Shanghai），与 Streamlit Cloud 服务器时区无关 | "
         "显示涨幅>2% 且成交额>1000万的股票"
     )
 
-    now_t = pd.Timestamp.now()
+    # ── 北京时间 + 精细交易状态 ──────────────────────────────────────────
+    _bj_now  = get_beijing_now()
+    _status, _s_color, _is_trading = get_trading_status(_bj_now)
+
+    # 状态图标
+    _status_icon = {
+        "集合竞价":          "🟡",
+        "竞价结束/等待开盘": "🟡",
+        "上午交易中":        "🟢",
+        "下午交易中":        "🟢",
+        "尾盘竞价":          "🟡",
+        "午间休市":          "⏸️",
+        "已收盘":            "🔴",
+        "休市（周末）":      "🔴",
+        "盘前":              "⚪",
+    }.get(_status, "⚪")
+
     st.markdown(
-        f"当前时间：**{now_t.strftime('%H:%M:%S')}**  |  "
-        f"交易状态：{'🟢 交易中' if 9 <= now_t.hour < 15 else '🔴 休市'}"
+        f"<div style='background:#1e2130;padding:10px 16px;border-radius:6px;"
+        f"border-left:4px solid {_s_color};margin-bottom:8px'>"
+        f"<b>当前北京时间：</b>{_bj_now.strftime('%Y-%m-%d %H:%M:%S')}&nbsp;&nbsp;|&nbsp;&nbsp;"
+        f"<b>交易状态：</b>{_status_icon} "
+        f"<span style='color:{_s_color};font-weight:bold'>{_status}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
     )
 
-    # 监控标的：自选股 + 最近筛选结果（最多200只）
+    # 交易阶段说明
+    with st.expander("📅 A股交易时段说明", expanded=False):
+        st.markdown(
+            "| 时间段 | 状态 |\n|--------|------|\n"
+            "| 09:15–09:25 | 集合竞价 |\n"
+            "| 09:25–09:30 | 竞价结束/等待开盘 |\n"
+            "| 09:30–11:30 | 上午交易 |\n"
+            "| 11:30–13:00 | 午间休市 |\n"
+            "| 13:00–14:57 | 下午交易 |\n"
+            "| 14:57–15:00 | 尾盘竞价 |\n"
+            "| 15:00 以后  | 已收盘 |\n"
+            "| 周六/周日   | 休市 |"
+        )
+
+    # ── 监控标的 ────────────────────────────────────────────────────────
     wl_auctn = load_watchlist()
     _r8      = st.session_state.result_df
     auctn_codes: list = list(wl_auctn)
@@ -3880,12 +3961,27 @@ with tab8:
             st.error(f"竞价数据获取失败：{exc}")
 
         if auctn_df.empty:
-            st.info("暂无符合条件的竞价数据（涨幅>2% 且成交额>1000万）。")
+            if not _is_trading:
+                st.info(
+                    f"当前 {_status}（{_bj_now.strftime('%H:%M')} 北京时间），"
+                    "行情快照数据可能为零或收盘价，竞价监控建议在 09:15 后使用。"
+                )
+            else:
+                st.info("暂无符合条件的竞价数据（涨幅>2% 且成交额>1000万）。")
         else:
-            disp8 = auctn_df[["竞价阶段", "快照时间", "code", "name",
-                               "竞价涨幅", "竞价量(万手)", "竞价额(亿)"]].copy()
-            disp8.columns = ["竞价阶段", "快照时间", "代码", "名称",
+            # 说明：行情快照≠系统时间
+            st.caption(
+                "⚠️ 下表「行情快照时间」为行情数据抓取时的北京时间，"
+                "**不代表当前系统时间**。当前北京时间见上方状态栏。"
+            )
+            # 安全取列（兼容新旧字段名）
+            _snap_col = "行情快照时间" if "行情快照时间" in auctn_df.columns else "快照时间"
+            _disp_cols_src = ["竞价阶段", _snap_col, "code", "name",
                               "竞价涨幅", "竞价量(万手)", "竞价额(亿)"]
+            _disp_cols_dst = ["竞价阶段", "行情快照时间(北京)", "代码", "名称",
+                              "竞价涨幅", "竞价量(万手)", "竞价额(亿)"]
+            disp8 = auctn_df[[c for c in _disp_cols_src if c in auctn_df.columns]].copy()
+            disp8.columns = _disp_cols_dst[:len(disp8.columns)]
             disp8.index += 1
             st.dataframe(disp8, use_container_width=True, height=420)
 
