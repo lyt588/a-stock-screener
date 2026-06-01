@@ -1049,6 +1049,108 @@ def _consec_detect_rate(board: str) -> float:
     return 0.095
 
 
+# ── 股票池持久化路径 ──────────────────────────────────────────────────────
+
+STOCK_CODES_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock_codes.csv")
+
+# 沪深 A 股代码段（仅 sh/sz，不含北交所）
+MARKET_RANGES: dict = {
+    "上证主板": [(600000, 605999)],   # sh60xxxx
+    "科创板":   [(688000, 688999)],   # sh688xxx
+    "深证主板": [(1,      2999)],     # sz0xxxxx
+    "创业板":   [(300000, 301999)],   # sz30xxxx
+}
+
+# 沪深 A 股有效前缀（排除北交所 8/4 开头及 B 股 9 开头）
+_SZ_SH_PREFIXES = ("0", "3", "6")
+
+# 模块级诊断变量（缓存命中时也可读取上次结果）
+_POOL_INFO: dict = {
+    "source":    "未加载",
+    "total":     0,
+    "breakdown": {},
+    "warnings":  [],
+    "log":       [],
+}
+
+
+def _count_by_market(codes: dict) -> dict:
+    """
+    按市场统计代码数量。
+    上证主板 60xxxx | 科创板 688xxx | 深证主板 00xxxx | 创业板 30xxxx
+    已排除：北交所(8/4开头) + B股(9开头) + 其他
+    """
+    cnt = {"上证主板": 0, "科创板": 0, "深证主板": 0, "创业板": 0, "已排除(北交所等)": 0}
+    for c in codes:
+        if   c.startswith("688"):          cnt["科创板"]           += 1
+        elif c.startswith("6"):            cnt["上证主板"]         += 1
+        elif c.startswith(("300","301")):  cnt["创业板"]           += 1
+        elif c.startswith("0"):            cnt["深证主板"]         += 1
+        else:                              cnt["已排除(北交所等)"] += 1
+    return cnt
+
+
+def _save_stock_codes_csv(codes_dict: dict) -> bool:
+    """持久化股票代码列表到 stock_codes.csv，返回是否成功"""
+    try:
+        pd.DataFrame(
+            [{"code": k, "name": v} for k, v in codes_dict.items()]
+        ).to_csv(STOCK_CODES_CSV, index=False, encoding="utf-8-sig")
+        return True
+    except Exception:
+        return False
+
+
+def _load_stock_codes_csv() -> dict:
+    """从 stock_codes.csv 加载代码（允许名称为空）"""
+    if not os.path.exists(STOCK_CODES_CSV):
+        return {}
+    try:
+        df = pd.read_csv(STOCK_CODES_CSV, dtype=str)
+        if "code" not in df.columns:
+            return {}
+        codes = df["code"].str.zfill(6)
+        names = df["name"].fillna("") if "name" in df.columns else pd.Series([""] * len(codes))
+        result = dict(zip(codes, names))
+        return {k: v for k, v in result.items() if re.match(r"^\d{6}$", k)}
+    except Exception:
+        return {}
+
+
+def _generate_pool_from_ranges() -> dict:
+    """
+    从已知沪深 A 股代码范围生成候选池（名称留空，不含北交所）。
+    生成约 13000 个候选，其中约 5200 只是实际在市股票；
+    无效代码由实时行情 API 自动过滤。
+    """
+    codes: dict = {
+        k: v for k, v in FALLBACK_STOCKS.items()
+        if k.startswith(_SZ_SH_PREFIXES)           # 内置列表也过滤北交所
+    }
+    for _segs in MARKET_RANGES.values():
+        for start, end in _segs:
+            for i in range(start, end + 1):
+                c = f"{i:06d}"
+                if c not in codes and c.startswith(_SZ_SH_PREFIXES):
+                    codes[c] = ""
+    return codes
+
+
+def _build_initial_csv_if_missing():
+    """首次启动时若 stock_codes.csv 不存在，用内置列表 + 范围生成一个基础版本"""
+    if os.path.exists(STOCK_CODES_CSV):
+        return
+    try:
+        pool = _generate_pool_from_ranges()
+        _save_stock_codes_csv(pool)
+    except Exception:
+        pass
+
+
+# 应用启动时生成基础 CSV（若不存在）
+_build_initial_csv_if_missing()
+
+
 # ── 实时行情（腾讯 qt.gtimg.cn）────────────────────────────────────────
 
 def code_to_tencent(code: str) -> str:
@@ -1060,56 +1162,111 @@ def code_to_tencent(code: str) -> str:
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_stock_list() -> dict:
     """
-    三级降级策略获取全市场 A 股代码-名称映射：
-    1. akshare stock_info_a_code_name（标准接口）
-    2. akshare 沪深京实时行情接口合并（备用）
-    3. 内置 500+ 只常见 A 股
-    """
-    # ── 策略 1：标准接口 ──────────────────────────────────────────────────
-    try:
-        import akshare as ak
-        df = ak.stock_info_a_code_name()
-        col_map = {}
-        if "代码" in df.columns: col_map["代码"] = "code"
-        if "名称" in df.columns: col_map["名称"] = "name"
-        if col_map:
-            df = df.rename(columns=col_map)
-        if "code" in df.columns and "name" in df.columns:
-            codes  = df["code"].astype(str).str.zfill(6)
-            result = dict(zip(codes, df["name"].astype(str)))
-            if len(result) > 500:
-                return result
-    except Exception:
-        pass
+    四级降级策略获取全市场 A 股代码-名称映射（含诊断）：
+    1. akshare stock_info_a_code_name（标准接口，期望≥4500只）
+    2. akshare 沪深京实时行情合并（期望≥4500只）
+    3. stock_codes.csv（本地/仓库预置，期望≥1000只）
+    4. 内置2500+只常见A股（最终兜底）
 
-    # ── 策略 2：沪深京实时行情合并 ────────────────────────────────────────
+    修复历史 Bug：
+    - 旧阈值 > 500 会让云端不完整数据（如 2505只）通过
+    - 新阈值 ≥ 4500 确保只返回完整全市场列表
+    """
+    global _POOL_INFO
+    log: list = []
+
+    # 内部辅助：解析 DataFrame → 沪深A股代码字典（排除北交所）
+    def _parse_and_validate(df: pd.DataFrame, tag: str) -> dict | None:
+        """
+        解析 DataFrame，抽取代码/名称；
+        过滤掉北交所(8/4开头)及B股(9开头)；
+        沪深A股完整列表期望 ≥ 4000 只。
+        """
+        try:
+            col_map = {}
+            for src, dst in [("代码","code"),("名称","name"),("股票代码","code"),("股票名称","name")]:
+                if src in df.columns: col_map[src] = dst
+            df = df.rename(columns=col_map)
+            code_col = next((c for c in df.columns if "code" in c.lower() or "代码" in c), None)
+            name_col = next((c for c in df.columns if "name" in c.lower() or "名称" in c), None)
+            if not code_col:
+                log.append(f"⚠️ {tag}：找不到代码列（列名={list(df.columns)[:5]}）")
+                return None
+            codes = df[code_col].astype(str).str.zfill(6)
+            names = df[name_col].astype(str) if name_col else pd.Series([""] * len(codes))
+            # 仅保留沪深A股（前缀 0/3/6），排除北交所(8/4)和B股(9)
+            raw = {k: v for k, v in zip(codes, names) if re.match(r"^\d{6}$", k)}
+            bj_count = sum(1 for c in raw if not c.startswith(_SZ_SH_PREFIXES))
+            result   = {k: v for k, v in raw.items() if k.startswith(_SZ_SH_PREFIXES)}
+            log.append(f"✅ {tag}：沪深 {len(result)} 只（已排除北交所等 {bj_count} 只）")
+            if len(result) >= 4000:
+                return result
+            log.append(f"⚠️ {tag}：沪深仅 {len(result)} 只（期望≥4000），继续尝试下一策略")
+            return None
+        except Exception as e:
+            log.append(f"❌ {tag}：解析失败 {type(e).__name__}: {e}")
+            return None
+
+    # ── 策略 1：akshare 标准接口 ──────────────────────────────────────────
     try:
         import akshare as ak
-        dfs: list = []
-        for fn_name in ("stock_sh_a_spot_em", "stock_sz_a_spot_em", "stock_bj_a_spot_em"):
+        result = _parse_and_validate(ak.stock_info_a_code_name(), "akshare·stock_info_a_code_name")
+        if result:
+            _save_stock_codes_csv(result)  # 自动持久化供云端回退使用
+            _POOL_INFO = {"source": "akshare·标准接口", "total": len(result),
+                          "breakdown": _count_by_market(result), "warnings": [], "log": log}
+            return result
+    except Exception as e:
+        log.append(f"❌ 策略1 import/call 失败: {type(e).__name__}: {e}")
+
+    # ── 策略 2：akshare 沪深实时行情合并（只取沪深，跳过北交所接口）──────
+    try:
+        import akshare as ak
+        sub_dfs: list = []
+        for fn_name in ("stock_sh_a_spot_em", "stock_sz_a_spot_em"):   # 不含 bj
             try:
                 fn  = getattr(ak, fn_name, None)
                 tmp = fn() if fn else None
                 if tmp is not None and not tmp.empty:
-                    dfs.append(tmp)
-            except Exception:
-                pass
-        if dfs:
-            combined  = pd.concat(dfs, ignore_index=True)
-            code_col  = next((c for c in combined.columns
-                              if "代码" in c or c.lower() in ("code", "股票代码")), None)
-            name_col  = next((c for c in combined.columns
-                              if "名称" in c or c.lower() in ("name", "股票名称")), None)
-            if code_col and name_col:
-                codes  = combined[code_col].astype(str).str.zfill(6)
-                result = dict(zip(codes, combined[name_col].astype(str)))
-                if len(result) > 200:
-                    return result
-    except Exception:
-        pass
+                    sub_dfs.append(tmp)
+                    log.append(f"  ↳ {fn_name}: {len(tmp)} 行")
+                else:
+                    log.append(f"  ↳ {fn_name}: 空结果")
+            except Exception as e2:
+                log.append(f"  ↳ {fn_name}: 失败 {e2}")
+        if sub_dfs:
+            combined = pd.concat(sub_dfs, ignore_index=True)
+            result   = _parse_and_validate(combined, "akshare·沪深合并")
+            if result:
+                _save_stock_codes_csv(result)
+                _POOL_INFO = {"source": "akshare·沪深合并", "total": len(result),
+                              "breakdown": _count_by_market(result), "warnings": [], "log": log}
+                return result
+    except Exception as e:
+        log.append(f"❌ 策略2 失败: {type(e).__name__}: {e}")
 
-    # ── 策略 3：内置大列表 ───────────────────────────────────────────────
-    return FALLBACK_STOCKS.copy()
+    # ── 策略 3：stock_codes.csv ────────────────────────────────────────
+    csv_raw    = _load_stock_codes_csv()
+    # 过滤北交所
+    csv_result = {k: v for k, v in csv_raw.items() if k.startswith(_SZ_SH_PREFIXES)}
+    if len(csv_result) >= 1000:
+        warns = []
+        if len(csv_result) < 4000:
+            warns.append(f"⚠️ CSV 中沪深股票仅 {len(csv_result)} 只（< 4000），建议点击「强制刷新股票池」")
+        log.append(f"✅ 策略3·CSV：沪深 {len(csv_result)} 只")
+        _POOL_INFO = {"source": "stock_codes.csv（本地/仓库）", "total": len(csv_result),
+                      "breakdown": _count_by_market(csv_result), "warnings": warns, "log": log}
+        return csv_result
+    else:
+        log.append(f"⚠️ 策略3·CSV：沪深仅 {len(csv_result)} 只，跳过")
+
+    # ── 策略 4：内置大列表（最终兜底，过滤北交所）────────────────────────
+    fb_filtered = {k: v for k, v in FALLBACK_STOCKS.items() if k.startswith(_SZ_SH_PREFIXES)}
+    warns4 = [f"⚠️ 所有在线策略失败，使用内置 {len(fb_filtered)} 只沪深A股，结果可能不完整"]
+    log.append(f"⚠️ 策略4·内置：{len(fb_filtered)} 只（已过滤北交所）")
+    _POOL_INFO = {"source": "内置列表（回退）", "total": len(fb_filtered),
+                  "breakdown": _count_by_market(fb_filtered), "warnings": warns4, "log": log}
+    return fb_filtered
 
 
 def _parse_rt(text: str) -> list:
@@ -2850,9 +3007,21 @@ def run_screening(
     with st.status("正在筛选…", expanded=True) as status:
         stock_dict = get_stock_list()
         codes_all  = codes if codes else list(stock_dict.keys())
-        src_note   = "akshare" if len(stock_dict) > 500 else "内置列表（akshare 不可用）"
-        st.session_state.pool_size = len(codes_all)
-        st.write(f"✅ 股票列表：{src_note}，共 **{len(codes_all)}** 只")
+        # 读取模块级诊断变量（由 get_stock_list 更新）
+        _pool_src  = _POOL_INFO.get("source", "未知")
+        _pool_warn = _POOL_INFO.get("warnings", [])
+        st.session_state.pool_size    = len(codes_all)
+        st.session_state.pool_source  = _pool_src
+        st.session_state.pool_log     = _POOL_INFO.get("log", [])
+        st.session_state.pool_break   = _POOL_INFO.get("breakdown", {})
+        if len(codes_all) < 4000:
+            st.warning(
+                f"⚠️ 沪深A股池仅 **{len(codes_all)}** 只（期望≥4000）。来源：{_pool_src}。"
+                "建议点击侧边栏「🔄 强制刷新股票池」重新拉取完整列表。"
+            )
+        for _w in _pool_warn:
+            st.warning(_w)
+        st.write(f"✅ 股票列表：{_pool_src}，共 **{len(codes_all)}** 只")
 
         st.write(f"正在获取腾讯实时行情（{len(codes_all)} 只，每批 {BATCH_SIZE}）…")
         try:
@@ -3031,20 +3200,51 @@ with st.sidebar:
     mc = SCREEN_MODE_CONFIG[screen_mode]
     st.caption(f"💡 {mc['desc']}")
 
-    # ── 股票池统计（上次筛选结果）────────────────────────────────────────
-    pool_sz  = st.session_state.get("pool_size",    0)
-    rt_cnt   = st.session_state.get("rt_count",     0)
-    flt_cnt  = st.session_state.get("filter_count", 0)
+    # ── 股票池状态面板 ────────────────────────────────────────────────────
+    pool_sz    = st.session_state.get("pool_size",    0)
+    rt_cnt     = st.session_state.get("rt_count",     0)
+    flt_cnt    = st.session_state.get("filter_count", 0)
+    pool_src   = st.session_state.get("pool_source",  "未加载")
+    pool_break = st.session_state.get("pool_break",   {})
+    pool_color = "#ef5350" if pool_sz < 5000 and pool_sz > 0 else "#26a69a"
 
     st.markdown(
         f"<div style='background:#1e2130;border-radius:6px;padding:8px 10px;"
-        f"font-size:0.82rem;margin:4px 0 8px 0'>"
-        f"📦 股票池 <b>{pool_sz:,}</b> 只 &nbsp;|&nbsp; "
-        f"📡 有效行情 <b>{rt_cnt:,}</b> 只 &nbsp;|&nbsp; "
-        f"✅ 筛选通过 <b>{flt_cnt}</b> 只"
+        f"font-size:0.82rem;margin:4px 0 4px 0'>"
+        f"📦 股票池 <b style='color:{pool_color}'>{pool_sz:,}</b> 只 &nbsp;|&nbsp; "
+        f"📡 有效 <b>{rt_cnt:,}</b> 只 &nbsp;|&nbsp; "
+        f"✅ 通过 <b>{flt_cnt}</b> 只"
         f"</div>",
         unsafe_allow_html=True,
     )
+    if pool_sz > 0:
+        st.caption(f"来源：{pool_src}")
+        if pool_break:
+            _bk = pool_break
+            _excluded = _bk.get("已排除(北交所等)", 0)
+            st.caption(
+                f"🔴 上证主板 {_bk.get('上证主板',0)} | "
+                f"🟣 科创板 {_bk.get('科创板',0)} | "
+                f"🔵 深证主板 {_bk.get('深证主板',0)} | "
+                f"🟢 创业板 {_bk.get('创业板',0)}"
+                + (f" | 已排除 {_excluded}" if _excluded > 0 else "")
+            )
+        # 只有沪深A股不足才报警（北交所缺失不报警）
+        if pool_sz < 4000:
+            st.warning(f"⚠️ 沪深A股 {pool_sz} 只 < 4000，建议强制刷新")
+
+    # 刷新股票池按钮
+    if st.button("🔄 强制刷新股票池", key="force_refresh_pool",
+                 help="清除缓存并重新从 akshare 获取完整股票列表，获取成功后自动保存到 stock_codes.csv"):
+        st.cache_data.clear()
+        st.rerun()
+
+    # 诊断日志（折叠）
+    _pool_log = st.session_state.get("pool_log", [])
+    if _pool_log:
+        with st.expander("🔍 股票池诊断日志", expanded=False):
+            for _line in _pool_log:
+                st.caption(_line)
 
     # ── 基础条件（所有模式）──────────────────────────────────────────────
     st.divider()
@@ -3168,6 +3368,9 @@ if "emotion_rt"    not in st.session_state: st.session_state.emotion_rt    = pd.
 if "pool_size"     not in st.session_state: st.session_state.pool_size     = 0
 if "rt_count"      not in st.session_state: st.session_state.rt_count      = 0
 if "filter_count"  not in st.session_state: st.session_state.filter_count  = 0
+if "pool_source"   not in st.session_state: st.session_state.pool_source   = "未加载"
+if "pool_log"      not in st.session_state: st.session_state.pool_log      = []
+if "pool_break"    not in st.session_state: st.session_state.pool_break    = {}
 if "v4_result"     not in st.session_state: st.session_state.v4_result     = {}
 
 
